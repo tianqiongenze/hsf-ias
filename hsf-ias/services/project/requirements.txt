@@ -1,0 +1,12 @@
+# project-svc 依赖（锁定口径=hsf-ias/requirements-base.txt，CONVENTIONS §2.1；基础镜像 szxc/base:1.2 已内置）
+pydantic==2.10.6
+graphql-core==3.2.5
+strawberry-graphql==0.254.1
+PyJWT
+pymysql
+redis
+cryptography
+uvicorn
+fastapi
+prometheus-client
+httpx

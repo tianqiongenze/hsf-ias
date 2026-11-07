@@ -1,0 +1,164 @@
+# HSF 基础层：命名空间、ResourceQuota、LimitRange、PriorityClass、Secret
+# 依据：CONVENTIONS.md §1/§2.15、hsf/docs/04 §3.0(三库双账号)/§7.3(Secret 键名冻结)、hsf/docs/06 §8.2
+# 注意：密码为强随机示例值，生产部署前必须轮换（kubectl create secret --from-literal 覆盖）
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hsf-dev
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hsf-prod
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: hsf-critical
+value: 1000000
+description: HSF 核心链路（网关 gw）
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: hsf-normal
+value: 800000
+description: HSF 常规业务（四子图/web）
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: hsf-batch
+value: 400000
+description: HSF 批处理/模拟与压测（sim/k6/Job，资源紧张可让位）
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: hsf-prod-quota
+  namespace: hsf-prod
+spec:
+  hard:
+    requests.cpu: "12"        # CONVENTIONS §2.15 冻结值；基础负载仅占 ~19%（06 号 §8.2），余量给 HPA/压测 Job
+    requests.memory: 24Gi
+    limits.cpu: "32"          # 满载(gw6+iam4+其余)约 26C，留 k6/Locust/E2E Job 余量
+    limits.memory: 48Gi       # CONVENTIONS §2.15 冻结值
+    persistentvolumeclaims: "10"
+    pods: "60"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: hsf-prod-limits
+  namespace: hsf-prod
+spec:
+  limits:
+  - type: Container
+    defaultRequest:
+      cpu: 100m
+      memory: 128Mi
+    default:
+      cpu: 500m
+      memory: 512Mi
+    max:
+      cpu: "4"
+      memory: 6Gi
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: hsf-dev-quota
+  namespace: hsf-dev
+spec:
+  hard:
+    requests.cpu: "12"        # dev 与 prod 同配额池（02 号 §5.1：同构、副本减半）
+    requests.memory: 24Gi
+    limits.cpu: "32"
+    limits.memory: 48Gi
+    pods: "60"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: hsf-dev-limits
+  namespace: hsf-dev
+spec:
+  limits:
+  - type: Container
+    defaultRequest:
+      cpu: 100m
+      memory: 128Mi
+    default:
+      cpu: 500m
+      memory: 512Mi
+    max:
+      cpu: "4"
+      memory: 6Gi
+---
+# Secret hsf-secrets（键名冻结：hsf/docs/04 §7.3）
+# 账号口径（CONVENTIONS §1/§3.2）：hsf_app=三库读写(write_pool) / hsf_ro=三库只读(read_pool)
+# 双连接池 host 均为 tidb.infra.svc.cluster.local:4000——不存在任何只读别名主机名（CONVENTIONS §0/§2.9）
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hsf-secrets
+  namespace: hsf-prod
+type: Opaque
+stringData:
+  DB_HOST_WRITE: tidb.infra.svc.cluster.local:4000
+  DB_HOST_READ: tidb.infra.svc.cluster.local:4000
+  DB_USER: hsf_app
+  DB_USER_RO: hsf_ro
+  DB_PASS: HsfApp-2026-kQ7wX2mVt9pR
+  DB_PASS_RO: HsfRo-2026-z3Nv8cJy5bLd
+  REDIS_URL: hsf-redis-0.hsf-redis-h.infra.svc.cluster.local:6379,hsf-redis-1.hsf-redis-h.infra.svc.cluster.local:6379,hsf-redis-2.hsf-redis-h.infra.svc.cluster.local:6379
+  REDIS_PASS: HsfRedis-2026-tR5yJ2hL8wPa
+  JWT_SECRET: HsfJwt-2026-bN8wQ4vXzA6sD1fG3hKm
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hsf-secrets
+  namespace: hsf-dev
+type: Opaque
+stringData:
+  DB_HOST_WRITE: tidb.infra.svc.cluster.local:4000
+  DB_HOST_READ: tidb.infra.svc.cluster.local:4000
+  DB_USER: hsf_app
+  DB_USER_RO: hsf_ro
+  DB_PASS: HsfApp-2026-kQ7wX2mVt9pR
+  DB_PASS_RO: HsfRo-2026-z3Nv8cJy5bLd
+  REDIS_URL: hsf-redis-0.hsf-redis-h.infra.svc.cluster.local:6379,hsf-redis-1.hsf-redis-h.infra.svc.cluster.local:6379,hsf-redis-2.hsf-redis-h.infra.svc.cluster.local:6379
+  REDIS_PASS: HsfRedis-2026-tR5yJ2hL8wPa
+  JWT_SECRET: HsfJwt-2026-bN8wQ4vXzA6sD1fG3hKm
+---
+# 默认拒绝入站；放行同命名空间、监控(Prometheus 抓取)、infra(Redis/TiDB 回包方向不收 ingress 限制)
+# 对齐 DV-IAS k8s/00-base.yaml 同名策略
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-allow-inner
+  namespace: hsf-prod
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - podSelector: {}
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: infra
+  # NodePort 场景（CONVENTIONS §1：NodePort 必须局域网可达）：eTP=Cluster 下跨节点转发流量
+  # 经 kube-proxy MASQ/内核选源后源为 192.168.235.231 这类 calico 隧道地址（ip route get 实测），
+  # LAN 客户端源为 10.167.x——pod 源选择器均无法匹配，不放行则 NodePort 请求被本策略静默丢弃
+  # （2026-11-07 部署实测定位：cali-tw "Drop if no policies passed" 100% 丢包点）。
+  - from:
+    - ipBlock: {cidr: 10.167.0.0/16}
+  - from:
+    - ipBlock: {cidr: 192.168.0.0/16}

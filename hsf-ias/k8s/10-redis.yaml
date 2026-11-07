@@ -1,0 +1,101 @@
+# HSF 独立 Redis Cluster（3 主，Redis 8 hostname 模式广播；infra 命名空间，独立于 hsf 配额）
+# 依据：CONVENTIONS §1/§3.5、hsf/docs/06 §8.2 辅助负载表
+# 集群初始化：3 pod Running 后逐个执行（announce hostname 必须用 ${} 原样传入容器）：
+#   redis-cli -a $REDIS_PASS --cluster create \
+#     hsf-redis-0.hsf-redis-h.infra.svc.cluster.local:6379 \
+#     hsf-redis-1.hsf-redis-h.infra.svc.cluster.local:6379 \
+#     hsf-redis-2.hsf-redis-h.infra.svc.cluster.local:6379 --cluster-yes
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hsf-secrets
+  namespace: infra
+type: Opaque
+stringData:
+  REDIS_PASS: HsfRedis-2026-tR5yJ2hL8wPa
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hsf-redis-h
+  namespace: infra
+spec:
+  clusterIP: None
+  selector:
+    app: hsf-redis
+  ports:
+  - name: client
+    port: 6379
+    targetPort: 6379
+  - name: bus
+    port: 16379
+    targetPort: 16379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hsf-redis
+  namespace: infra
+spec:
+  serviceName: hsf-redis-h
+  replicas: 3
+  selector:
+    matchLabels:
+      app: hsf-redis
+  template:
+    metadata:
+      labels:
+        app: hsf-redis
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app: hsf-redis
+      containers:
+      - name: redis
+        image: 10.167.2.175:30500/base/redis:8-alpine
+        command: ["/bin/sh", "-c"]
+        args:
+        - >
+          exec redis-server
+          --cluster-enabled yes
+          --cluster-config-file /data/nodes.conf
+          --cluster-announce-hostname "${HOSTNAME}.hsf-redis-h.infra.svc.cluster.local"
+          --cluster-announce-port 6379
+          --cluster-announce-bus-port 16379
+          --cluster-preferred-endpoint-type hostname
+          --requirepass "$(REDIS_PASS)"
+          --masterauth "$(REDIS_PASS)"
+          --maxmemory 1gb
+          --maxmemory-policy allkeys-lru
+          --appendonly yes
+          --protected-mode no
+        env:
+        - name: REDIS_PASS
+          valueFrom:
+            secretKeyRef:
+              name: hsf-secrets
+              key: REDIS_PASS
+        ports:
+        - containerPort: 6379
+        - containerPort: 16379
+        resources:
+          requests: {cpu: 250m, memory: 512Mi}
+          limits: {cpu: "1", memory: 2Gi}
+        readinessProbe:
+          exec:
+            command: ["/bin/sh", "-c", "redis-cli -a $REDIS_PASS ping | grep PONG"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        emptyDir: {}   # 缓存可重建；Pod 重启后重跑上方 --cluster create 重建槽位

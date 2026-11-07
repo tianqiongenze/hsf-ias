@@ -1,0 +1,14 @@
+# HSF 锁定依赖（CONVENTIONS §2.1）：前三个为事故级精确锁定，其余沿用 DV-IAS 已验证区间
+# 基础镜像 10.167.2.175:30500/szxc/base:1.2 已内置同版依赖，容器内无需重复安装
+pydantic==2.10.6
+graphql-core==3.2.5
+strawberry-graphql==0.254.1
+PyJWT==2.10.*
+pymysql==1.1.*
+redis==5.2.*
+cryptography==44.*
+uvicorn[standard]==0.34.*
+fastapi==0.115.*
+prometheus-client==0.21.*
+httpx==0.28.*
+pytest==8.*

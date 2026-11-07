@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>高标准农田·移动端</title>
+<style>
+:root{--g:#2E7D32;--g2:#43A047;--y:#F9A825;--bg:#FAFDF7;--ink:#1B2B1D;--line:#DCE7DC;--red:#C62828}
+*{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,"PingFang SC","HarmonyOS Sans","Microsoft YaHei",sans-serif}
+body{background:var(--bg);color:var(--ink);font-size:17px;padding-bottom:70px;max-width:640px;margin:0 auto}
+.hd{background:linear-gradient(135deg,var(--g),var(--g2));color:#fff;padding:18px 16px 14px;position:sticky;top:0;z-index:5}
+.hd h1{font-size:21px}
+.hd .sub{font-size:13px;opacity:.85;margin-top:4px}
+.tabs{position:fixed;bottom:0;left:0;right:0;background:#fff;border-top:1px solid var(--line);display:flex;z-index:5;max-width:640px;margin:0 auto}
+.tabs div{flex:1;text-align:center;padding:8px 0 10px;color:#7B8B7D;font-size:12px;cursor:pointer}
+.tabs div.on{color:var(--g);font-weight:600}
+.tabs .ic{font-size:22px;display:block;margin-bottom:2px}
+.card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px;margin:12px;box-shadow:0 1px 3px rgba(46,125,50,.06)}
+.card h3{font-size:16px;color:var(--g);margin-bottom:8px}
+.mrow{padding:11px 0;border-bottom:1px dashed var(--line)}
+.mrow:last-child{border:none}
+.mrow b{font-size:16px}
+.tag{display:inline-block;font-size:12px;padding:2px 8px;border-radius:10px;background:#E8F5E9;color:var(--g);margin-right:6px}
+.tag.fin{background:#FFF3E0;color:#E65100}.tag.gr{background:#EEE;color:#777}.tag.rd{background:#FFEBEE;color:var(--red)}
+.btn{display:block;width:100%;padding:14px;border:none;border-radius:12px;background:var(--g);color:#fff;font-size:17px;cursor:pointer;margin-top:10px}
+.btn:active{background:#1B5E20}.btn.y{background:var(--y);color:#5D4037}.btn.ghost{background:#fff;color:var(--g);border:1px solid var(--g)}
+input,select,textarea{width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-size:17px;background:#fff;margin:6px 0}
+.mets{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;text-align:center}
+.mets .m{background:#FAFDF7;border:1px solid var(--line);border-radius:12px;padding:10px 4px}
+.mets .v{font-size:19px;font-weight:700;color:var(--g)}
+.mets .k{font-size:12px;color:#7B8B7D;margin-top:3px}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.chips button{border:1px solid var(--g);color:var(--g);background:#fff;border-radius:16px;padding:5px 14px;font-size:14px}
+.chips button.on{background:var(--g);color:#fff}
+.hidden{display:none}
+#cam{width:100%;border-radius:10px;background:#000;display:none}
+.big{font-size:19px}
+.kv{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px dashed var(--line);font-size:15px}
+.kv span:first-child{color:#556B57}
+.ok-toast{position:fixed;top:20%;left:50%;transform:translateX(-50%);background:rgba(27,43,29,.92);color:#fff;padding:12px 22px;border-radius:10px;font-size:15px;display:none;z-index:99}
+</style>
+</head>
+<body>
+<div class="hd"><h1>🌾 绿野县·农田管护</h1><div class="sub" id="who">扫码报修 · 情上报 · 告警随手查</div></div>
+
+<!-- 扫码 -->
+<section id="p-scan">
+  <div class="card">
+    <h3>📷 设施/地块扫码</h3>
+    <p style="font-size:14px;color:#7B8B7D;margin-bottom:6px">扫设施二维码（内容为 URL+token），或手输 token；支持粘贴完整链接自动提取</p>
+    <video id="cam" playsinline muted></video>
+    <div class="chips"><button onclick="scanCam()">启动摄像头扫码</button><button class="on" onclick="stopCam()">停止</button></div>
+    <input id="sToken" placeholder="粘贴 token 或二维码链接">
+    <button class="btn ghost" onclick="resolveToken()">解析查询</button>
+    <div id="sResult"><div class="mrow" style="color:#7B8B7D">尚未解析</div></div>
+  </div>
+</section>
+
+<!-- 上报 -->
+<section id="p-report" class="hidden">
+  <div class="card">
+    <h3>🔧 设施报修/巡检上报</h3>
+    <select id="rFac"></select>
+    <textarea id="rDesc" rows="3" placeholder="描述问题（如：泵站电机异响，出水不足）"></textarea>
+    <input id="rContact" placeholder="联系电话（选填，平台脱敏展示）">
+    <button class="btn" onclick="report()">提交上报</button>
+  </div>
+  <div class="card"><h3>🧾 工单动态</h3><div id="myWo"><div class="mrow">登录后查看</div></div></div>
+</section>
+
+<!-- 告警 -->
+<section id="p-alert" class="hidden">
+  <div class="card">
+    <h3>📣 农情告警
+      <select id="aVillage" style="width:auto;padding:4px 8px;font-size:14px;margin:0"><option value="">全部村</option></select></h3>
+    <div class="chips" id="aChips">
+      <button class="on" data-v="">全部</button><button data-v="OPEN">未处置</button><button data-v="PROCESSING">处置中</button><button data-v="CLOSED">已关闭</button>
+    </div>
+    <div id="alList"><div class="mrow">加载中…</div></div>
+  </div>
+  <div class="card"><h3>🌡️ 传感器最新值</h3><div class="mets" id="latest"></div></div>
+</section>
+
+<!-- 我的 -->
+<section id="p-me" class="hidden">
+  <div class="card" id="loginCard">
+    <h3>👤 登录</h3>
+    <input id="lPhone" placeholder="手机号（演示村管：13800000604）">
+    <input id="lPass" type="password" placeholder="密码（hsf@2026）">
+    <button class="btn" onclick="doLogin()">登录</button>
+    <p style="font-size:13px;color:#7B8B7D;margin-top:8px">县管 13800000601 · 乡镇 602/603 · 村管 604~607 · 管护员 608 · 合作社 609，密码均 hsf@2026</p>
+  </div>
+  <div id="meCard" class="hidden">
+    <div class="card"><h3>💚 我的账户 <button class="btn y" style="width:auto;margin:0;padding:6px 14px;font-size:14px" onclick="logout()">退出</button></h3><div id="meInfo"></div></div>
+  </div>
+</section>
+
+<div class="tabs">
+  <div class="on" onclick="tab('scan',this)"><span class="ic">📷</span>扫码</div>
+  <div onclick="tab('report',this)"><span class="ic">🔧</span>上报</div>
+  <div onclick="tab('alert',this)"><span class="ic">📣</span>告警</div>
+  <div onclick="tab('me',this)"><span class="ic">👤</span>我的</div>
+</div>
+<div class="ok-toast" id="toast"></div>
+<script src="/js/gql.js"></script>
+<script>
+// 移动端：扫码（二维码 token→facilityByToken）→ 报修上报 → sim 告警查看
+let A_STATE='';
+const P_STATUS={ACTIVE:'在用',RETIRED:'已停用'};
+function toast(t){const e=document.getElementById('toast');e.textContent=t;e.style.display='block';setTimeout(()=>e.style.display='none',2400)}
+function tab(p,el){
+  stopCam();
+  document.querySelectorAll('.tabs div').forEach(x=>x.classList.remove('on'));el.classList.add('on');
+  ['scan','report','alert','me'].forEach(s=>document.getElementById('p-'+s).classList.toggle('hidden',s!==p));
+  if(p==='report'){ensureFacilities();loadMyWo();}
+  if(p==='alert')loadAlerts();
+  if(p==='me')renderMe();
+}
+
+async function doLogin(){
+  try{
+    const d=await login(lPhone.value.trim(),lPass.value);
+    toast('欢迎，'+d.name);renderMe();
+  }catch(e){toast('登录失败：'+e.message)}
+}
+async function renderMe(){
+  if(!TOK())return;
+  document.getElementById('loginCard').classList.add('hidden');
+  document.getElementById('meCard').classList.remove('hidden');
+  try{
+    const d=await gql(`{me{name role phoneMasked org{name}}}`);
+    document.getElementById('who').textContent='欢迎，'+(d.me?d.me.name:'');
+    document.getElementById('meInfo').innerHTML=d.me?`
+      <div class="kv"><span>姓名</span><b>${esc(d.me.name)}</b></div>
+      <div class="kv"><span>角色</span><b>${esc(d.me.role)}</b></div>
+      <div class="kv"><span>手机</span><b>${esc(d.me.phoneMasked)}</b></div>
+      <div class="kv"><span>所属组织</span><b>${esc(d.me.org?d.me.org.name:'—')}</b></div>`:'<div class="mrow">会话已失效，请重新登录</div>';
+  }catch(e){}
+}
+
+// ── 扫码：BarcodeDetector 原生扫码（浏览器不支持则手输 token）──
+let scanTimer=null;
+async function scanCam(){
+  if(!('BarcodeDetector' in window))return toast('当前浏览器不支持原生扫码，请手输 token');
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
+    const v=document.getElementById('cam');v.srcObject=stream;v.style.display='block';await v.play();
+    const det=new window.BarcodeDetector();
+    scanTimer=setInterval(async()=>{
+      try{
+        const cs=await det.detect(v);
+        if(cs.length){sToken.value=cs[0].rawValue;stopCam();resolveToken();}
+      }catch(e){}
+    },400);
+  }catch(e){toast('相机不可用：'+e.message)}
+}
+function stopCam(){
+  if(scanTimer){clearInterval(scanTimer);scanTimer=null;}
+  const v=document.getElementById('cam');
+  if(v&&v.srcObject){v.srcObject.getTracks().forEach(t=>t.stop());v.srcObject=null;v.style.display='none';}
+}
+// 二维码内容=URL+token（facility 子图签发），兼容纯 token / 完整链接 / ?token= 参数
+function pickToken(s){
+  const m=/[?&]token=([A-Za-z0-9_\-]+)/.exec(s||'');
+  return m?m[1]:(s||'').trim();
+}
+async function resolveToken(){
+  const t=pickToken(sToken.value);
+  if(!t)return toast('请先扫码或输入 token');
+  document.getElementById('sResult').innerHTML='<div class="mrow">解析中…</div>';
+  try{
+    const d=await gql(`query($t:String!){facilityByToken(token:$t){code name type villageCode status parcel{code}}}`,{t});
+    const f=d.facilityByToken;
+    if(!f){document.getElementById('sResult').innerHTML='<div class="mrow">token 无效或已失效</div>';return;}
+    document.getElementById('sResult').innerHTML=`
+      <div class="mrow"><b>${esc(f.code)}</b> ${esc(f.name)}</div>
+      <div class="kv"><span>类型</span><b>${FACILITY_TYPE[f.type]||esc(f.type)}</b></div>
+      <div class="kv"><span>村</span><b>${vName(f.villageCode)}</b></div>
+      <div class="kv"><span>状态</span><b>${FACILITY_STATUS[f.status]||esc(f.status)}</b></div>
+      <div class="kv"><span>所属地块</span><b>${f.parcel?esc(f.parcel.code):'—'}</b></div>`;
+    // 预选到上报页，一键转报修
+    await ensureFacilities();
+    rFac.value=f.code;
+    document.getElementById('sResult').insertAdjacentHTML('beforeend','<button class="btn y" onclick="tab(\'report\',document.querySelectorAll(\'.tabs div\')[1])">转报修上报</button>');
+  }catch(e){document.getElementById('sResult').innerHTML='<div class="mrow">'+esc(e.message)+'</div>'}
+}
+
+// ── 上报 ──
+let FAC_LOADED=false;
+async function ensureFacilities(){
+  if(FAC_LOADED)return;
+  try{
+    const d=await gql(`{facilities(size:100){items{code name type villageCode}}}`);
+    rFac.innerHTML=d.facilities.items.map(f=>`<option value="${f.code}">${f.code} ${esc(f.name)}（${FACILITY_TYPE[f.type]||f.type}·${vName(f.villageCode)}）</option>`).join('');
+    FAC_LOADED=true;
+  }catch(e){rFac.innerHTML='<option value="">设施加载失败（需登录）</option>'}
+}
+async function report(){
+  if(!TOK()){toast('请先在「我的」登录');return tab('me',document.querySelectorAll('.tabs div')[3])}
+  if(!rFac.value)return toast('请选择设施');
+  if(!rDesc.value.trim())return toast('请描述问题');
+  try{
+    const d=await gql(`mutation($f:String!,$d:String!,$c:String){reportWorkorder(facilityCode:$f,description:$d,contact:$c){sn state}}`,
+      {f:rFac.value,d:rDesc.value.trim(),c:rContact.value.trim()||undefined});
+    toast('上报成功！工单号 '+d.reportWorkorder.sn);
+    rDesc.value='';rContact.value='';loadMyWo();
+  }catch(e){toast(e.message)}
+}
+async function loadMyWo(){
+  if(!TOK())return;
+  try{
+    const d=await gql(`{workorders(size:10){items{sn state description facility{code name} createdAt}}}`);
+    document.getElementById('myWo').innerHTML=d.workorders.items.map(w=>`
+      <div class="mrow"><b>${w.sn}</b> <span class="tag ${w.state==='APPROVED'?'':w.state==='RESOLVED'?'fin':'fin'}">${WORKORDER_STATE[w.state]||w.state}</span>
+      <div style="font-size:13px;color:#7B8B7D">${w.facility?esc(w.facility.name):''} · ${esc(w.description||'').slice(0,20)} · ${(w.createdAt||'').slice(5,16).replace('T',' ')}</div></div>`).join('')||'<div class="mrow">暂无工单</div>';
+  }catch(e){document.getElementById('myWo').innerHTML='<div class="mrow">'+esc(e.message)+'</div>'}
+}
+
+// ── 告警（sim REST 经 web 同源代理）──
+document.getElementById('aChips').onclick=e=>{
+  if(e.target.tagName!=='BUTTON')return;
+  A_STATE=e.target.dataset.v;
+  document.querySelectorAll('#aChips button').forEach(b=>b.classList.toggle('on',b===e.target));
+  loadAlerts();
+};
+VILLAGES.forEach(([c,n])=>aVillage.insertAdjacentHTML('beforeend',`<option value="${c}">${n}</option>`));
+async function loadAlerts(){
+  try{
+    const [d,lt]=await Promise.all([
+      sim('/alerts',{state:A_STATE,villageCode:aVillage.value,page:1,size:20}),
+      sim('/latest',{villageCode:aVillage.value}),
+    ]);
+    document.getElementById('alList').innerHTML=d.items.map(a=>`
+      <div class="mrow"><span class="tag ${a.state==='OPEN'?'rd':a.state==='PROCESSING'?'fin':'gr'}">${ALERT_STATE[a.state]||a.state}</span>
+      <b>${RULE_NAME[a.ruleCode]||esc(a.ruleCode)}</b><span class="tag">${METRIC_NAME[a.metric]||esc(a.metric)} ${a.trigValue}</span>
+      <div style="font-size:13px;color:#7B8B7D">${esc(a.sensorCode)} · ${vName(a.villageCode)} · ${(a.trigTime||'').slice(5,16).replace('T',' ')}</div></div>`).join('')||'<div class="mrow">暂无告警</div>';
+    document.getElementById('latest').innerHTML=(lt.items||[]).slice(0,6).map(x=>`
+      <div class="m"><div class="v">${x.value}</div><div class="k">${esc(x.sensorCode.slice(-4))}·${METRIC_NAME[x.metric]||esc(x.metric)}</div></div>`).join('')||'<div class="mrow">暂无读数（可请管理员执行 /sim/tick）</div>';
+  }catch(e){document.getElementById('alList').innerHTML='<div class="mrow">'+esc(e.message)+'</div>'}
+}
+
+// 二维码直开本页（URL 带 ?token=）自动解析
+if(location.search.includes('token=')){sToken.value=location.search;resolveToken();}
+if(TOK())renderMe();
+</script>
+</body>
+</html>

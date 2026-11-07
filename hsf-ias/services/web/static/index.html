@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>高标准农田·一张图</title>
+<style>
+:root{--g:#2E7D32;--g2:#43A047;--y:#F9A825;--bg:#F4F8F4;--ink:#1B2B1D;--line:#DCE7DC}
+*{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+body{background:var(--bg);color:var(--ink);font-size:15px}
+.top{background:linear-gradient(135deg,var(--g),var(--g2));color:#fff;padding:13px 24px;display:flex;justify-content:space-between;align-items:center}
+.top h1{font-size:19px}
+.top .who{font-size:13px;opacity:.9;display:flex;gap:14px;align-items:center}
+.top a{color:#fff;font-size:13px;cursor:pointer;text-decoration:underline}
+.bar{display:flex;gap:14px;align-items:center;padding:10px 24px;background:#fff;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.chip{background:#E8F5E9;color:var(--g);border-radius:10px;padding:4px 12px;font-size:13px}
+.chip b{font-size:16px}
+select{padding:6px 10px;border:1px solid var(--line);border-radius:8px;font-size:14px}
+#mode{font-size:12px;color:#7B8B7D;margin-left:auto}
+.wrap{display:flex;gap:14px;padding:14px 24px;align-items:stretch}
+#mapBox{flex:1;min-height:66vh;background:#DDEBD9;border:1px solid var(--line);border-radius:12px;overflow:hidden;position:relative}
+#mapBox svg{width:100%;height:66vh;display:block}
+#mapBox polygon{cursor:pointer;stroke:#1B5E20;stroke-width:1.2;transition:fill-opacity .15s}
+#mapBox polygon:hover{fill-opacity:.85}
+#mapBox polygon.sel{stroke:var(--y);stroke-width:3}
+#mapBox .empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#7B8B7D}
+#mapBox .leafbg{background:#DDEBD9}
+#attr{width:300px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:16px;align-self:flex-start}
+#attr h3{color:var(--g);font-size:16px;margin-bottom:10px}
+#attr .row{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px dashed var(--line);font-size:14px}
+#attr .row span:first-child{color:#7B8B7D}
+#attr .empty-tip{color:#9AA89B;font-size:14px;padding:30px 0;text-align:center}
+#login{max-width:420px;margin:10vh auto;background:#fff;border:1px solid var(--line);border-radius:14px;padding:28px}
+#login h2{color:var(--g);margin-bottom:14px}
+#err{padding:8px 24px;color:#C62828;font-size:13px;min-height:20px}
+input{padding:10px;border:1px solid var(--line);border-radius:9px;font-size:15px;width:100%;margin:4px 0 10px}
+.btn{border:none;border-radius:9px;padding:11px 22px;background:var(--g);color:#fff;cursor:pointer;font-size:15px}
+</style>
+</head>
+<body>
+<div id="login">
+  <h2>🌾 高标准农田·一张图</h2>
+  <input id="lPhone" placeholder="手机号（演示县管：13800000601）">
+  <input id="lPass" type="password" placeholder="密码（hsf@2026）">
+  <button class="btn" style="width:100%" onclick="doLogin()">登 录</button>
+  <p style="font-size:13px;color:#7B8B7D;margin-top:10px">地块 GeoJSON 来自 land 子图 landGeojson 查询；访客角色仅能查看有权限的村</p>
+</div>
+<div id="app" style="display:none">
+  <div class="top"><h1>🌾 绿野县高标准农田一张图</h1>
+    <span class="who"><span id="who"></span><a onclick="location.href='/admin/'">管理端</a><a onclick="location.href='/mobile/'">移动端</a><a onclick="logout()">退出</a></span></div>
+  <div class="bar">
+    <span class="chip">地块 <b id="kTotal">0</b> 块</span>
+    <span class="chip">总面积 <b id="kArea">0</b> 亩</span>
+    <select id="fVillage" onchange="loadMap()"><option value="">全部村</option></select>
+    <span id="mode">渲染模式检测中…</span>
+  </div>
+  <div id="err"></div>
+  <div class="wrap">
+    <div id="mapBox"><div class="empty">加载中…</div></div>
+    <div id="attr"><h3>地块属性</h3><div class="empty-tip">点击地图上的地块查看统一编码与属性</div></div>
+  </div>
+</div>
+<script src="/js/gql.js"></script>
+<script>
+// 一张图：landGeojson（FeatureCollection JSON）→ Leaflet（本机 vendored 可用时）或纯 SVG polygon 渲染
+let FC={type:'FeatureCollection',features:[]};
+let PARCELS={}; // code -> landParcels 属性（含 holder，用于点击面板富化）
+const P_STATUS={ACTIVE:'在用',RETIRED:'已停用'};
+const PAL=['#2E7D32','#66BB6A','#9CCC65','#F9A825','#039BE5','#8D6E63'];
+const hash=s=>{let h=0;for(const c of String(s||''))h=(h*31+c.charCodeAt(0))>>>0;return h;};
+const color=f=>PAL[hash((f.properties&&(f.properties.cropType||f.properties.soilType))||'')%PAL.length];
+
+VILLAGES.forEach(([c,n])=>fVillage.insertAdjacentHTML('beforeend',`<option value="${c}">${n}</option>`));
+
+async function doLogin(){
+  try{
+    const d=await login(lPhone.value.trim(),lPass.value);
+    document.getElementById('login').style.display='none';
+    document.getElementById('app').style.display='';
+    document.getElementById('who').textContent=d.name;
+    loadMap();
+  }catch(e){document.getElementById('err').textContent='登录失败：'+e.message}
+}
+
+async function loadMap(){
+  const err=document.getElementById('err');err.textContent='';
+  document.querySelector('#mapBox .empty')&&(document.querySelector('#mapBox').innerHTML='<div class="empty">加载中…</div>');
+  try{
+    const vs=fVillage.value?[fVillage.value]:VILLAGES.map(v=>v[0]);
+    const rs=await Promise.all(vs.map(async c=>{
+      const g=await gql(`query($v:String!){landGeojson(villageCode:$v)}`,{v:c});
+      const s=await gql(`query($v:String!){landStats(villageCode:$v){villageCode total totalAreaMu}}`,{v:c});
+      const p=await gql(`query($v:String!){landParcels(villageCode:$v,size:100){items{code name areaMu soilType cropType status holder{name}}}}`,{v:c});
+      let fc;try{fc=JSON.parse(g.landGeojson)}catch(e){fc={type:'FeatureCollection',features:[]}}
+      return {fc,st:s.landStats,items:p.landParcels.items};
+    }));
+    PARCELS={};rs.forEach(r=>r.items.forEach(p=>PARCELS[p.code]=p));
+    FC={type:'FeatureCollection',features:rs.flatMap(r=>(r.fc.features||[]).map(f=>{
+      // FeatureCollection 属性薄时用 landParcels 富化，保证点击面板字段齐全
+      const code=f.properties&&f.properties.code;
+      return {type:'Feature',geometry:f.geometry,properties:Object.assign({},code&&PARCELS[code]||{},f.properties||{})};
+    }))};
+    document.getElementById('kTotal').textContent=rs.reduce((a,r)=>a+(r.st.total||0),0);
+    document.getElementById('kArea').textContent=rs.reduce((a,r)=>a+(r.st.totalAreaMu||0),0).toFixed(1);
+    clearSel();
+    // 优先本机 vendored Leaflet（增强），不可用自动回退纯 SVG——两种模式均支持点击看属性
+    const ok=await tryLeaflet();
+    document.getElementById('mode').textContent='渲染模式：'+(ok?'Leaflet 矢量增强（离线无底图瓦片）':'纯 SVG polygon');
+    ok?leafletRender():svgRender();
+  }catch(e){
+    if(e.code==='UNAUTHENTICATED'){document.getElementById('app').style.display='none';document.getElementById('login').style.display='';}
+    err.textContent='加载失败：'+e.message;
+  }
+}
+
+// 尝试动态加载本机 /vendor/leaflet/（构建期 vendored；404 或超时 → 回退 SVG）
+function tryLeaflet(){
+  return new Promise(res=>{
+    let done=false;const fin=ok=>{if(!done){done=true;res(ok)}};
+    const t=setTimeout(()=>fin(false),3000);
+    const link=document.createElement('link');link.rel='stylesheet';link.href='/vendor/leaflet/leaflet.css';document.head.appendChild(link);
+    const s=document.createElement('script');s.src='/vendor/leaflet/leaflet.js';
+    s.onload=()=>{clearTimeout(t);fin(typeof window.L!=='undefined')};
+    s.onerror=()=>{clearTimeout(t);fin(false)};
+    document.head.appendChild(s);
+  });
+}
+
+function attrHtml(f){
+  const p=f.properties||{};
+  const row=(k,v)=>v!==undefined&&v!==null&&v!==''?`<div class="row"><span>${k}</span><b>${esc(String(v))}</b></div>`:'';
+  return (p.code?`<b>${esc(p.code)}</b><br>`:'')+row('名称',p.name)+row('村',vName(p.villageCode)||(p.villageCode))
+    +row('面积(亩)',p.areaMu)+row('土壤',p.soilType)+row('作物',p.cropType)
+    +row('状态',P_STATUS[p.status]||p.status)+row('权属人',p.holder&&p.holder.name);
+}
+function showAttr(code){
+  const f=FC.features.find(x=>x.properties&&x.properties.code===code);
+  document.querySelectorAll('#mapBox polygon.sel').forEach(x=>x.classList.remove('sel'));
+  const el=document.querySelector(`#mapBox polygon[data-code="${code}"]`);el&&el.classList.add('sel');
+  document.getElementById('attr').innerHTML='<h3>地块属性</h3>'+(f?attrHtml(f):'<div class="empty-tip">未找到该地块</div>');
+}
+function clearSel(){
+  document.querySelectorAll('#mapBox polygon.sel').forEach(x=>x.classList.remove('sel'));
+  document.getElementById('attr').innerHTML='<h3>地块属性</h3><div class="empty-tip">点击地图上的地块查看统一编码与属性</div>';
+}
+
+// ── 纯 SVG 渲染（无任何外部依赖，局域网必可用）──
+function svgRender(){
+  const box=document.getElementById('mapBox');
+  const pts=[];
+  FC.features.forEach(f=>{const cs=f.geometry&&f.geometry.coordinates;if(cs&&cs[0])cs[0].forEach(pt=>pts.push(pt));});
+  if(!pts.length){box.innerHTML='<div class="empty">暂无地块几何数据</div>';return;}
+  const xs=pts.map(p=>p[0]),ys=pts.map(p=>p[1]);
+  const minLon=Math.min(...xs),maxLon=Math.max(...xs),minLat=Math.min(...ys),maxLat=Math.max(...ys);
+  const k=Math.cos(((minLat+maxLat)/2)*Math.PI/180)||1; // 经度按纬度余弦等比修正，避免东西向拉伸
+  const w=Math.max((maxLon-minLon)*k,1e-9),h=Math.max(maxLat-minLat,1e-9);
+  const W=960,H=Math.max(1,Math.round(W*h/w)),pad=0.04;
+  const X=lon=>+(((lon-minLon)*k/w)*(W*(1-2*pad))+W*pad).toFixed(1);
+  const Y=lat=>+((1-(lat-minLat)/h)*(H*(1-2*pad))+H*pad).toFixed(1);
+  const polys=FC.features.map(f=>{
+    const ring=(f.geometry&&f.geometry.coordinates&&f.geometry.coordinates[0])||[];
+    const ps=ring.map(pt=>X(pt[0])+','+Y(pt[1])).join(' ');
+    const code=(f.properties&&f.properties.code)||'';
+    return `<polygon data-code="${esc(code)}" fill="${color(f)}" fill-opacity="0.55" points="${ps}"><title>${esc(code)}</title></polygon>`;
+  }).join('');
+  box.innerHTML=`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${polys}</svg>`;
+  box.onclick=e=>{
+    const c=e.target.dataset&&e.target.dataset.code;
+    c?showAttr(c):clearSel();
+  };
+}
+
+// ── Leaflet 增强渲染（本机 vendored 库；无底图瓦片，纯矢量离线模式）──
+function leafletRender(){
+  const box=document.getElementById('mapBox');
+  box.innerHTML='<div id="lfMap" class="leafbg" style="width:100%;height:66vh"></div>';
+  const map=L.map('lfMap',{attributionControl:false});
+  const layer=L.geoJSON(FC,{
+    style:f=>({color:'#1B5E20',weight:1.2,fillColor:color(f),fillOpacity:0.55}),
+    onEachFeature:(f,l)=>{f.properties&&f.properties.code&&l.on('click',()=>showAttr(f.properties.code));l.bindTooltip((f.properties&&f.properties.code)||'');},
+  }).addTo(map);
+  map.on('click',clearSel);
+  map.fitBounds(layer.getBounds(),{padding:[14,14]});
+}
+</script>
+</body>
+</html>

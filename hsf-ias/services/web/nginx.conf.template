@@ -1,0 +1,29 @@
+# HSF web 站点：三页静态 + 内网同源反代（${GW_UPSTREAM}/${SIM_UPSTREAM} 由容器 env 注入）
+# 浏览器全部流量同源，规避跨域；机器/压测流量仍按 docs/05 §7 直连 sim NodePort 31211
+server {
+    listen 80;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+    server_tokens off;
+
+    # GraphQL 网关同源代理（前端也可用 localStorage hsf_gw 覆盖为直连 http://<node>:30090）
+    location = /graphql {
+        proxy_pass http://${GW_UPSTREAM};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    # sim REST 同源代理（/sim/alerts 等路径原样透传；FastAPI 服务未开跨域头，浏览器必须走本代理）
+    location /sim/ {
+        proxy_pass http://${SIM_UPSTREAM};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    # HTML 不缓存（演示期改动即时生效），vendored 库可缓存
+    location ~* \.html$ { add_header Cache-Control "no-cache"; }
+    location /vendor/ { add_header Cache-Control "public, max-age=86400"; }
+
+    location / { try_files $uri $uri/ =404; }
+}

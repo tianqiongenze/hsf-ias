@@ -1,0 +1,14 @@
+# HSF 监控接入：ServiceMonitor（Prometheus 抓取各子图/sim/web 的 /metrics）
+# label 需与 kube-prometheus-stack 的 serviceMonitorSelector 匹配（CONVENTIONS §2.16）
+# selector 只匹配带 metrics:"true" 的 Service——gw-svc 不带该 label（网关无 /metrics，CONVENTIONS §2.16 例外）
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: hsf-services
+  namespace: hsf-prod
+  labels: {release: kube-prometheus-stack, metrics: "true"}
+spec:
+  namespaceSelector: {matchNames: [hsf-prod]}
+  selector: {matchLabels: {metrics: "true"}}
+  endpoints: [{port: http-metrics, path: /metrics, interval: 30s}]
