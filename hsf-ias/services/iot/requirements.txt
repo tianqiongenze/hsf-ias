@@ -1,0 +1,5 @@
+# iot 服务新增依赖（CONVENTIONS-P2 T-2）：基础镜像 10.167.2.175:30500/szxc/base:1.2
+# 已内置 requirements-base.txt 全部锁定依赖（fastapi/uvicorn/prometheus-client/PyJWT 等），
+# 本文件仅列二期增量，Dockerfile 构建期 pip install；本地开发先装 base 再装本文件。
+psycopg2-binary==2.9.10
+paho-mqtt==2.1.0

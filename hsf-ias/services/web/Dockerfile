@@ -11,8 +11,10 @@ RUN mkdir -p /usr/share/nginx/html/vendor \
  || echo "构建期离线：跳过 Leaflet vendored，运行时自动回退纯 SVG"
 
 # 同源代理上游（由 nginx 官方镜像的 envsubst 模板机制渲染；hsf-dev 部署时覆盖环境变量即可）
+# 二期增量 IOT_UPSTREAM（docs/07 §4.7：默认值同法 + manifest env 显式声明，缺省时 envsubst 渲染空上游会致 nginx 拒启）
 ENV GW_UPSTREAM=gw-svc.hsf-prod.svc.cluster.local:8090 \
-    SIM_UPSTREAM=sim-svc.hsf-prod.svc.cluster.local:8095
+    SIM_UPSTREAM=sim-svc.hsf-prod.svc.cluster.local:8095 \
+    IOT_UPSTREAM=iot-svc.hsf-prod.svc.cluster.local:8097
 
 COPY services/web/nginx.conf.template /etc/nginx/templates/default.conf.template
 COPY services/web/static/ /usr/share/nginx/html/

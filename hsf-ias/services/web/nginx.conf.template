@@ -1,4 +1,4 @@
-# HSF web 站点：三页静态 + 内网同源反代（${GW_UPSTREAM}/${SIM_UPSTREAM} 由容器 env 注入）
+# HSF web 站点：三页静态 + 内网同源反代（${GW_UPSTREAM}/${SIM_UPSTREAM}/${IOT_UPSTREAM} 由容器 env 注入）
 # 浏览器全部流量同源，规避跨域；机器/压测流量仍按 docs/05 §7 直连 sim NodePort 31211
 server {
     listen 80;
@@ -17,6 +17,16 @@ server {
     # sim REST 同源代理（/sim/alerts 等路径原样透传；FastAPI 服务未开跨域头，浏览器必须走本代理）
     location /sim/ {
         proxy_pass http://${SIM_UPSTREAM};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    # iot REST 同源代理（二期：设备/最新值/告警/灌溉建议/通知，docs/07 §4.6/§4.7）
+    # 注意结尾 "/"：iot 冻结契约（§4.6）路由无 /iot 前缀（/devices /sensor/latest /alerts
+    # /irrigation-advice /notify），proxy_pass 带 URI（"/"）时 nginx 剥离 location 前缀再转发——
+    # 即浏览器 /iot/devices → iot /devices；${IOT_UPSTREAM} 与既有上游同一 env 注入模式，禁止硬编码 namespace
+    location /iot/ {
+        proxy_pass http://${IOT_UPSTREAM}/;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
     }

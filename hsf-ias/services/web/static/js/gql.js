@@ -3,6 +3,8 @@
 const GW = localStorage.getItem('hsf_gw') ?? '';
 // sim REST 默认走 web 同源代理（nginx /sim/ 反代，免跨域）；覆盖为 http://<node>:31211 可直连（需 sim 开跨域头）
 const SIM = localStorage.getItem('hsf_sim') ?? '/sim';
+// iot REST（二期：设备/最新值/告警/灌溉建议/通知，docs/07 §4.6）默认走 web 同源代理（nginx /iot/ 反代）；同法可覆盖直连 31213
+const IOT = localStorage.getItem('hsf_iot') ?? '/iot';
 const TOK = () => localStorage.getItem('hsf_token') || '';
 
 // GraphQL 查询：业务失败抛 Error（message=中文文案，err.code=extensions.code）
@@ -30,6 +32,19 @@ async function sim(path, params = {}) {
   return r.json();
 }
 
+// iot REST（二期，docs/07 §4.6 契约）：GET 带 query 参数；method='POST' 走路径直发（如通知已读）
+async function iot(path, params = {}, method = 'GET') {
+  const qs = method === 'GET'
+    ? Object.entries(params).filter(([, v]) => v !== '' && v !== null && v !== undefined)
+        .map(([k, v]) => k + '=' + encodeURIComponent(v)).join('&') : '';
+  const r = await fetch(IOT + path + (qs ? '?' + qs : ''), {
+    method,
+    headers: { 'Content-Type': 'application/json', ...(TOK() ? { Authorization: 'Bearer ' + TOK() } : {}) },
+  });
+  if (!r.ok) throw new Error('iot HTTP ' + r.status);
+  return r.json();
+}
+
 // 登录并持久化（HSF 演示口令 hsf@2026；错密 → UNAUTHENTICATED）
 async function login(phone, password) {
   const d = await gql(`mutation($p:String!,$w:String!){login(phone:$p,password:$w){token name roles partyId}}`, { p: phone, w: password });
@@ -52,3 +67,7 @@ const FACILITY_STATUS = { NORMAL: '正常', BROKEN: '损坏', REPAIRING: '维修
 const RULE_NAME = { RULE_DROUGHT: '旱情', RULE_WATERLOGGING: '渍害', RULE_GALE: '大风', RULE_PEST: '虫害' };
 const ALERT_STATE = { OPEN: '未处置', PROCESSING: '处置中', CLOSED: '已关闭' };
 const METRIC_NAME = { soil_moisture: '墒情%', air_temp: '气温℃', wind_speed: '风速m/s', rainfall: '雨量mm', pest_index: '虫情', water_level: '水位m' };
+// 二期增量中文映射（docs/07 §4.4/§4.5/§4.6 冻结枚举）
+const SENSOR_STATUS = { ACTIVE: '在线', OFFLINE: '离线' };
+const ADVICE_STATE = { OPEN: '待处置', CLOSED: '已闭环' };
+const NOTIFY_KIND = { ALERT: '告警', ADVICE: '灌溉建议' };

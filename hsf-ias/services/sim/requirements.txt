@@ -1,0 +1,4 @@
+# sim 服务新增依赖（二期 MQTT 发布器，CONVENTIONS-P2 T-2）：基础镜像
+# 10.167.2.175:30500/szxc/base:1.2 已内置 requirements-base.txt 全部锁定依赖，
+# 本文件仅列二期增量，Dockerfile 构建期 pip install；与 iot 侧同版锁定。
+paho-mqtt==2.1.0

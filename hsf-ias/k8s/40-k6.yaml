@@ -1,6 +1,21 @@
 # HSF k6 基线压测（Job，按需手动创建；镜像为集群已有 perf/k6:0.1.3，entrypoint=/bin/sh -c）
 # 阈值对齐 DV-IAS：browse p95<500 / report p95<800 / 失败率<5%（CONVENTIONS §4：0 失败、p95 记录在案）
 # 内嵌脚本与 perf/baseline.js 同源（browse 200VU + report 20VU）
+#
+# 二期 iot-write 时序吞吐场景说明（docs/07 §6.3 冻结设计；T-2：单独报告，不进本 Job thresholds）：
+#   场景位置：perf/stress.js 的 iot-write 场景（与本 ConfigMap 同源同步原则，本文件不内嵌其脚本）
+#   压测路径：登录态 POST {SIM}/sim/tick?steps=500（直打 sim NodePort 31211——机器流量直连口径，
+#             05 §7 评审 R10；不顶格 TICK_MAX_STEPS=5000，留 10× 余量）
+#   负载模型：constant-vus 4 VU × 每 VU 50 次迭代，迭代间 sleep 5s（iot 缓冲排水），
+#             单次请求 timeout 120s；单迭代发布 500 步×48 台=2.4 万条，总量 4×50×2.4 万=480 万条
+#             （与 docs/07 §3.6"压测余量"容量口径一致）
+#   背压防护：sim 发布器 max_inflight_messages_set(100) 对齐 broker max_inflight_messages（§2.3/§6.3），
+#             防单迭代 2.4 万条 QoS1 同步发布堵死 paho 默认 inflight=20
+#   度量口径：k6 侧 Trend iot_tick_duration + Counter iot_published；结束后取 iot /metrics 的
+#             hsf_iot_readings_written_total 差值 ÷ elapsed = 条/s（全链路：sim 生成→MQTT→iot 缓冲→TimescaleDB 落库）
+#   判读记录：①稳态吞吐条/s ②hsf_iot_flush_seconds p95 ③hsf_iot_onconflict_skipped_total（应≈0）
+#             ④无积压（tick 响应时间无单调上涨）；参考目标 ≥5000 条/s（观测记录，无硬阈值）
+#   报告出口：数值与命令输出写入 docs/21（二期融合测试报告），不参与 k6 thresholds 判定
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -10,16 +25,18 @@ metadata:
 data:
   baseline.js: |
     // HSF k6 基线压测（与 perf/baseline.js 同源；由部署流程同步，勿手改）
+    // 二期限流适配（docs/07 §6.4 冻结设计）：browse 每 VU login-once，登录号循环取自
+    // 04 §9.1 冻结 15 账号（RATE_CAP=1200 固定窗口下无登录 ip: 键必 429——§6.4 改造）。
     import http from 'k6/http';
     import { check, sleep } from 'k6';
     const GATEWAY = __ENV.GATEWAY || 'http://gw-svc.hsf-prod.svc.cluster.local:8090/';
     export const options = {
       scenarios: {
-        browse: {  // S1 一张图/地块浏览（读路径，验证多级缓存+联邦跨域 holder 解析）
+        browse: {  // S1 读路径：地块详情+权属联邦解析（登录态，限流键=账号）
           executor: 'ramping-vus', startVUs: 10, stages: [
             { duration: '30s', target: 200 }, { duration: '1m', target: 200 }, { duration: '15s', target: 0 }],
           exec: 'browse' },
-        report: {  // S2 设施报修工单上报（写路径，登录+mutation）
+        report: {  // S2 写路径：报修工单上报（任意登录角色）
           executor: 'constant-vus', vus: 20, duration: '1m', startTime: '30s', exec: 'report' },
       },
       thresholds: {
@@ -30,24 +47,37 @@ data:
     };
     const PARCELS = ['L5306000001', 'L5306000002', 'L5306000003', 'L5306000004',
                      'L5306000005', 'L5306000006', 'L5306000007', 'L5306000008'];
-    const BROWSE_Q = (c) => JSON.stringify({
-      query: `{ landParcel(code:"${c}"){ code name areaMu holder { name } } }` });
+    const PHONES = ['13800000601', '13800000602', '13800000603', '13800000604', '13800000605',
+                    '13800000606', '13800000607', '13800000608', '13800000609', '13800000610',
+                    '13900000901', '13900000902', '13900000903', '13900000904', '13900000905'];
+    let TOKEN = '';
+    function loginOnce() {
+      if (TOKEN) return TOKEN;
+      const phone = PHONES[__VU % PHONES.length];
+      const login = http.post(GATEWAY, JSON.stringify({
+        query: 'mutation($p:String!,$w:String!){login(phone:$p,password:$w){token}}',
+        variables: { p: phone, w: 'hsf@2026' } }),
+        { headers: { 'Content-Type': 'application/json' } });
+      try { TOKEN = login.json('data.login.token') || ''; } catch (e) { TOKEN = ''; }
+      return TOKEN;
+    }
     export function browse() {
-      const r = http.post(GATEWAY, BROWSE_Q(PARCELS[__ITER % 8]), { headers: { 'Content-Type': 'application/json' } });
+      const token = loginOnce();
+      check(token, { 'login-ok': () => !!token });
+      const code = PARCELS[__ITER % 8];
+      const r = http.post(GATEWAY, JSON.stringify({
+        query: `{ landParcel(code:"${code}"){ code name areaMu holder { name } } }`,
+      }), { headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` } });
       check(r, { 'browse-200': (res) => res.status === 200 });
       sleep(1 + Math.random() * 3);
     }
     export function report() {
-      const login = http.post(GATEWAY, JSON.stringify({
-        query: 'mutation($p:String!,$w:String!){login(phone:$p,password:$w){token}}',
-        variables: { p: '13800000604', w: 'hsf@2026' } }),
-        { headers: { 'Content-Type': 'application/json' } });
-      const token = login.json('data.login.token');
-      check(login, { 'login-ok': () => !!token });
+      const token = loginOnce();
+      check(token, { 'login-ok': () => !!token });
       if (!token) { sleep(1); return; }
       const r = http.post(GATEWAY, JSON.stringify({
         query: 'mutation($f:String!,$d:String!){reportWorkorder(facilityCode:$f,description:$d){id sn state}}',
-        variables: { f: 'F5306000001', d: 'k6压测报修' } }),
+        variables: { f: 'F5306000001', d: 'k6基线报修' } }),
         { headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` } });
       check(r, { 'report-200': (res) => res.status === 200 });
       sleep(2);

@@ -79,6 +79,17 @@ input,select,textarea{width:100%;padding:12px;border:1px solid var(--line);borde
     <div id="alList"><div class="mrow">加载中…</div></div>
   </div>
   <div class="card"><h3>🌡️ 传感器最新值</h3><div class="mets" id="latest"></div></div>
+  <div class="card">
+    <h3>💧 灌溉建议 <span style="font-size:12px;color:#7B8B7D">（建议值，供决策参考）</span></h3>
+    <div id="advList"><div class="mrow">加载中…</div></div>
+  </div>
+  <div class="card">
+    <h3>🔔 站内通知</h3>
+    <div class="chips" id="nChips">
+      <button class="on" data-u="">全部</button><button data-u="1">未读</button>
+    </div>
+    <div id="ntList"><div class="mrow">加载中…</div></div>
+  </div>
 </section>
 
 <!-- 我的 -->
@@ -104,7 +115,7 @@ input,select,textarea{width:100%;padding:12px;border:1px solid var(--line);borde
 <div class="ok-toast" id="toast"></div>
 <script src="/js/gql.js"></script>
 <script>
-// 移动端：扫码（二维码 token→facilityByToken）→ 报修上报 → sim 告警查看
+// 移动端：扫码（二维码 token→facilityByToken）→ 报修上报 → sim 告警 + 二期灌溉建议/站内通知（iot REST 经 /iot/ 同源反代）
 let A_STATE='';
 const P_STATUS={ACTIVE:'在用',RETIRED:'已停用'};
 function toast(t){const e=document.getElementById('toast');e.textContent=t;e.style.display='block';setTimeout(()=>e.style.display='none',2400)}
@@ -216,12 +227,20 @@ async function loadMyWo(){
   }catch(e){document.getElementById('myWo').innerHTML='<div class="mrow">'+esc(e.message)+'</div>'}
 }
 
-// ── 告警（sim REST 经 web 同源代理）──
+// ── 告警（sim REST 经 web 同源代理）+ 灌溉建议/站内通知（二期 iot REST 经 /iot/ 反代）──
 document.getElementById('aChips').onclick=e=>{
   if(e.target.tagName!=='BUTTON')return;
   A_STATE=e.target.dataset.v;
   document.querySelectorAll('#aChips button').forEach(b=>b.classList.toggle('on',b===e.target));
   loadAlerts();
+};
+// 通知过滤：全部/仅未读（N_UNREAD=1 时带 unreadOnly=true）
+let N_UNREAD='';
+document.getElementById('nChips').onclick=e=>{
+  if(e.target.tagName!=='BUTTON')return;
+  N_UNREAD=e.target.dataset.u;
+  document.querySelectorAll('#nChips button').forEach(b=>b.classList.toggle('on',b===e.target));
+  loadNotify();
 };
 VILLAGES.forEach(([c,n])=>aVillage.insertAdjacentHTML('beforeend',`<option value="${c}">${n}</option>`));
 async function loadAlerts(){
@@ -237,6 +256,40 @@ async function loadAlerts(){
     document.getElementById('latest').innerHTML=(lt.items||[]).slice(0,6).map(x=>`
       <div class="m"><div class="v">${x.value}</div><div class="k">${esc(x.sensorCode.slice(-4))}·${METRIC_NAME[x.metric]||esc(x.metric)}</div></div>`).join('')||'<div class="mrow">暂无读数（可请管理员执行 /sim/tick）</div>';
   }catch(e){document.getElementById('alList').innerHTML='<div class="mrow">'+esc(e.message)+'</div>'}
+  loadAdvice();
+  loadNotify();
+}
+
+// 灌溉建议（iot /irrigation-advice，docs/07 §4.3：建议值为决策参考，实际执行由管护员修正）
+async function loadAdvice(){
+  try{
+    const d=await iot('/irrigation-advice',{page:1,size:10});
+    document.getElementById('advList').innerHTML=d.items.map(a=>`
+      <div class="mrow"><span class="tag ${a.state==='OPEN'?'fin':'gr'}">${ADVICE_STATE[a.state]||a.state}</span>
+      <b>${esc(a.parcelCode)}</b> <span class="tag">墒情 ${a.triggerValue}%</span>
+      <div style="font-size:13px;color:#7B8B7D">建议灌溉 <b style="color:var(--g)">${a.perMuM3}</b> m³/亩${a.totalM3!=null?'，合计 '+a.totalM3+' m³':''} · ${vName(a.villageCode)} · ${(a.createdAt||'').slice(5,16).replace('T',' ')}</div></div>`).join('')
+      ||'<div class="mrow">暂无灌溉建议（墒情低于 40% 时自动生成）</div>';
+  }catch(e){document.getElementById('advList').innerHTML='<div class="mrow">'+esc(e.message)+'</div>'}
+}
+
+// 站内通知（iot /notify，role 取自 JWT 防越权，docs/07 §4.5；未读可逐条置已读）
+async function loadNotify(){
+  try{
+    const d=await iot('/notify',{unreadOnly:N_UNREAD,page:1,size:20});
+    document.getElementById('ntList').innerHTML=(d.items||[]).map(n=>`
+      <div class="mrow"><span class="tag ${n.kind==='ALERT'?'rd':'fin'}">${NOTIFY_KIND[n.kind]||esc(n.kind)}</span>
+      <b>${esc(n.title)}</b>${n.readAt?'':' <span class="tag">未读</span>'}
+      <div style="font-size:13px;color:#7B8B7D">${esc(n.content)}</div>
+      <div style="font-size:12px;color:#9AA89B">${vName(n.villageCode)} · ${(n.createdAt||'').slice(5,16).replace('T',' ')}
+      ${n.readAt?'':'<a href="javascript:void(0)" style="color:var(--g)" onclick="notifyRead('+n.id+')">标记已读</a>'}</div></div>`).join('')
+      ||'<div class="mrow">暂无通知</div>';
+  }catch(e){document.getElementById('ntList').innerHTML='<div class="mrow">'+esc(e.message)+'</div>'}
+}
+async function notifyRead(id){
+  try{
+    await iot('/notify/'+id+'/read',{},'POST');
+    toast('已标记已读');loadNotify();
+  }catch(e){toast('操作失败：'+e.message)}
 }
 
 // 二维码直开本页（URL 带 ?token=）自动解析

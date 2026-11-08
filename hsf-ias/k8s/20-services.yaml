@@ -1,10 +1,13 @@
 # HSF 应用层：网关 + 四 GraphQL 子图 + sim(REST) + web（命名空间 hsf-prod）
+# 二期新增（CONVENTIONS-P2 T-1/T-2）：ratelimit-svc(8096) + iot-svc(8097/NodePort 31213)，
+# gw 限流判定移至 ratelimit-svc（env RATE_SVC，进程内桶删除）；sim/iot 增 MQTT_PASS/TIMESCALE_DSN
 # 逐项冻结依据：hsf/docs/06 §8.2 工作负载与资源清单（部署冻结源）、CONVENTIONS §1/§2.5/§2.14/§2.15/§2.16
 # 上线前核验：ss -tln 确认 NodePort 未被占用，冲突则顺延并记录（CONVENTIONS §1）
 # 实际记录（2026-11-07 部署）：原 gw NodePort 30090 被跨租户 dify-plus/redis8-node-0 占用
-# （ss 不可见、仅集群分配表可见），按 §1 顺延为 30099；sim=31211、web=31210 无冲突保留。
+# （ss 不可见、仅集群分配表可见），按 §1 顺延为 30099；sim=31211、web=31210 无冲突保留；
+# 二期 iot=31213（T-3 端口分配，上线前仍须 ss -tln 核验）。
 # hsf-dev 同构部署：副本减半 + sed 's/hsf-prod/hsf-dev/g' 后另行 apply（本文件只冻结 prod）
-# 镜像统一来自集群私有仓库 10.167.2.175:30500/hsf/*
+# 镜像统一来自集群私有仓库 10.167.2.175:30500/hsf/*；二期重建镜像统一 tag 2.0（T-2，部署阶段随构建更新）
 ---
 # ─── gw：Apollo 网关，业务 8090(GraphQL) + 探针 9090(/healthz；8090 是 GraphQL，/healthz 会 400——CONVENTIONS §2.5) ───
 apiVersion: apps/v1
@@ -24,14 +27,17 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: gw}}}
       containers:
       - name: gw
-        image: 10.167.2.175:30500/hsf/gw:1.1.2
+        image: 10.167.2.175:30500/hsf/gw:2.0
         ports: [{containerPort: 8090}, {containerPort: 9090}]
         env:
         - {name: JWT_SECRET, valueFrom: {secretKeyRef: {name: hsf-secrets, key: JWT_SECRET}}}
-        - {name: RATE_CAP, value: "1200"}
         - name: SUBGRAPHS
           value: "iam=http://iam-svc.hsf-prod.svc.cluster.local:8091/graphql,land=http://land-svc.hsf-prod.svc.cluster.local:8092/graphql,project=http://project-svc.hsf-prod.svc.cluster.local:8093/graphql,facility=http://facility-svc.hsf-prod.svc.cluster.local:8094/graphql"
-        - {name: RATE_CAP, value: "6000"}   # 令牌桶 6000/min，按 user.sub 或 ip 分桶（CONVENTIONS §2.6）
+        # 二期限流改造（docs/07 §5.2/§5.3 env 冻结表）：判定移至 ratelimit-svc（Redis 固定窗口全局计数），
+        # gw 只做 HTTP 调用 fail-open（非 200/网络错误/500ms 超时=放行+节流告警日志，同 key 60s 一条）
+        - {name: RATE_MODE, value: "svc"}   # svc=调 ratelimit-svc（二期常态）；local=一期进程内桶回退开关
+        - {name: RATE_SVC, value: "http://ratelimit-svc.hsf-prod.svc.cluster.local:8096"}
+        - {name: RATE_CAP, value: "6000"}   # 仅 local 回退模式读取（进程内桶局部口径；一期重复键 1200/6000 已清理）
         resources: {requests: {cpu: 100m, memory: 384Mi}, limits: {cpu: "2", memory: 1Gi}}
         readinessProbe: {httpGet: {path: /healthz, port: 9090}, periodSeconds: 5}
         livenessProbe: {httpGet: {path: /healthz, port: 9090}, initialDelaySeconds: 60, periodSeconds: 10}
@@ -204,9 +210,13 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: sim-svc}}}
       containers:
       - name: app
-        image: 10.167.2.175:30500/hsf/sim:1.0.1
+        image: 10.167.2.175:30500/hsf/sim:2.0
         ports: [{containerPort: 8095}]
         envFrom: [{secretRef: {name: hsf-secrets}}]
+        env:
+        # 二期 MQTT 发布者（T-2）：密码经 hsf-secrets 注入（user hsf@hsf-mqtt:1883，docs/07 §1.4）。
+        # sim 2.0 不连 TimescaleDB（时序写职责移交 iot，docs/07 §9-④⑤），故无 TIMESCALE_* env
+        - {name: MQTT_PASS, valueFrom: {secretKeyRef: {name: hsf-secrets, key: MQTT_PASS}}}
         resources: {requests: {cpu: 250m, memory: 384Mi}, limits: {cpu: "2", memory: 1Gi}}
         readinessProbe: {httpGet: {path: /readyz, port: 8095}, periodSeconds: 5, failureThreshold: 3}
         livenessProbe: {httpGet: {path: /healthz, port: 8095}, initialDelaySeconds: 20, periodSeconds: 10}
@@ -237,7 +247,7 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: web}}}
       containers:
       - name: app
-        image: 10.167.2.175:30500/hsf/web:1.0
+        image: 10.167.2.175:30500/hsf/web:2.0
         ports: [{containerPort: 80}]
         resources: {requests: {cpu: 150m, memory: 256Mi}, limits: {cpu: "1", memory: 512Mi}}
         readinessProbe: {httpGet: {path: /, port: 80}, periodSeconds: 5}
@@ -252,3 +262,80 @@ spec:
   type: NodePort
   selector: {app: web}
   ports: [{name: http-metrics, port: 80, targetPort: 80, nodePort: 31210}]
+---
+# ─── ratelimit-svc（二期新增）：全局固定窗口限流（:8096，ClusterIP）───
+# 判定：Redis Cluster Lua 原子 INCRBY(cost)+条件 EXPIRE(120)，键 hsf:rl:{key}:{分钟epoch}
+# （docs/07 §5.1 / CONVENTIONS-P2 T-2 冻结；gw 经 env RATE_SVC HTTP 调用，本服务不可用时 gw fail-open）
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: ratelimit-svc, namespace: hsf-prod, labels: {app: ratelimit-svc}}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: ratelimit-svc}}
+  template:
+    metadata: {labels: {app: ratelimit-svc}}
+    spec:
+      priorityClassName: hsf-normal
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: ratelimit-svc}}}
+      containers:
+      - name: app
+        image: 10.167.2.175:30500/hsf/ratelimit:2.0
+        ports: [{containerPort: 8096}]
+        envFrom: [{secretRef: {name: hsf-secrets}}]   # REDIS_URL/REDIS_PASS（hsf-redis 集群，infra）
+        env:
+        # 窗口容量 req/min/键：docs/07 §5.1/§9-③ 二期冻结 1200——1500 突发必触发 429（§5.4 验证口径）
+        - {name: RATE_CAP, value: "1200"}
+        resources: {requests: {cpu: 150m, memory: 256Mi}, limits: {cpu: "1", memory: 512Mi}}
+        readinessProbe: {httpGet: {path: /readyz, port: 8096}, periodSeconds: 5, failureThreshold: 3}
+        livenessProbe: {httpGet: {path: /healthz, port: 8096}, initialDelaySeconds: 20, periodSeconds: 10}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: ratelimit-svc, namespace: hsf-prod, labels: {app: ratelimit-svc, metrics: "true"}}
+spec: {selector: {app: ratelimit-svc}, ports: [{name: http-metrics, port: 8096, targetPort: 8096}]}
+---
+# ─── iot-svc（二期新增）：MQTT 订阅接入 + TimescaleDB 批量写 + 规则引擎/灌溉决策/通知（:8097，NodePort 31213）───
+# 单副本冻结（docs/07 §1.2，禁 HPA）：paho-mqtt 订阅为独立消费（MQTT 无共享消费组语义），
+# 多副本将对同一 topic 重复入库双写时序；T-3 端口分配 iot=31213（上线前 ss -tln 核验）
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: iot-svc, namespace: hsf-prod, labels: {app: iot-svc}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: iot-svc}}
+  template:
+    metadata: {labels: {app: iot-svc}}
+    spec:
+      priorityClassName: hsf-normal
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: iot-svc}}}
+      containers:
+      - name: app
+        image: 10.167.2.175:30500/hsf/iot:2.0.6
+        ports: [{containerPort: 8097}]
+        envFrom: [{secretRef: {name: hsf-secrets}}]   # DB_*/REDIS_*/MQTT_PASS/TIMESCALE_PASS 全量注入（§1.4）
+        env:
+        # 显式列出二期键（§1.4 冻结）：MQTT user=hsf@hsf-mqtt:1883；TIMESCALE_PASS 为三方共用密码键
+        - {name: MQTT_PASS, valueFrom: {secretKeyRef: {name: hsf-secrets, key: MQTT_PASS}}}
+        - {name: TIMESCALE_PASS, valueFrom: {secretKeyRef: {name: hsf-secrets, key: TIMESCALE_PASS}}}
+        # TimescaleDB 连接串（§1.4 冻结形态）：密码引用上方 TIMESCALE_PASS（$(VAR) 仅展开先前显式 env；
+        # envFrom 键不参与展开）。短名同命名空间解析，hsf-dev 同构 sed 派生无需替换
+        - {name: TIMESCALE_DSN, value: "postgresql://hsf:$(TIMESCALE_PASS)@hsf-timescale:5432/hsf_ts"}
+        resources: {requests: {cpu: 250m, memory: 384Mi}, limits: {cpu: "2", memory: 1Gi}}
+        readinessProbe: {httpGet: {path: /readyz, port: 8097}, periodSeconds: 5, failureThreshold: 3}
+        livenessProbe: {httpGet: {path: /healthz, port: 8097}, initialDelaySeconds: 20, periodSeconds: 10}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: iot-svc, namespace: hsf-prod, labels: {app: iot-svc, metrics: "true"}}
+spec:
+  type: NodePort
+  selector: {app: iot-svc}
+  ports: [{name: http-metrics, port: 8097, targetPort: 8097, nodePort: 31213}]

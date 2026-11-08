@@ -114,6 +114,10 @@ stringData:
   DB_PASS_RO: HsfRo-2026-z3Nv8cJy5bLd
   REDIS_URL: hsf-redis-0.hsf-redis-h.infra.svc.cluster.local:6379,hsf-redis-1.hsf-redis-h.infra.svc.cluster.local:6379,hsf-redis-2.hsf-redis-h.infra.svc.cluster.local:6379
   REDIS_PASS: HsfRedis-2026-tR5yJ2hL8wPa
+  # 二期增键（docs/07 §1.4 冻结，两命名空间同步）：MQTT_PASS=mosquitto/sim/iot 共用（MQTT_USER=hsf 固定）；
+  # TIMESCALE_PASS=hsf-timescale(POSTGRES_PASSWORD)/iot(TIMESCALE_DSN)/init-ts.sh 三方共用同一键
+  MQTT_PASS: HsfMqtt-2026-wR6yJ9kQ3vXt
+  TIMESCALE_PASS: HsfTs-2026-mK4vN8xQ2wZr
   JWT_SECRET: HsfJwt-2026-bN8wQ4vXzA6sD1fG3hKm
 ---
 apiVersion: v1
@@ -131,6 +135,9 @@ stringData:
   DB_PASS_RO: HsfRo-2026-z3Nv8cJy5bLd
   REDIS_URL: hsf-redis-0.hsf-redis-h.infra.svc.cluster.local:6379,hsf-redis-1.hsf-redis-h.infra.svc.cluster.local:6379,hsf-redis-2.hsf-redis-h.infra.svc.cluster.local:6379
   REDIS_PASS: HsfRedis-2026-tR5yJ2hL8wPa
+  # 二期增键（docs/07 §1.4 冻结，两命名空间同步）：与 hsf-prod 同值（同构派生 sed 不动 Secret 内容）
+  MQTT_PASS: HsfMqtt-2026-wR6yJ9kQ3vXt
+  TIMESCALE_PASS: HsfTs-2026-mK4vN8xQ2wZr
   JWT_SECRET: HsfJwt-2026-bN8wQ4vXzA6sD1fG3hKm
 ---
 # 默认拒绝入站；放行同命名空间、监控(Prometheus 抓取)、infra(Redis/TiDB 回包方向不收 ingress 限制)

@@ -15,7 +15,9 @@ REQ_LATENCY = Histogram("hsf_http_request_seconds", "HTTP延迟", ["svc", "path"
 JWT_SECRET = os.environ.get("JWT_SECRET", "HsfJwt-2026-bN8wQ4vXzA6sD1fG")  # 与 gw 同源（hsf-secrets）
 
 
-def create_app(svc_name: str, startup=None) -> FastAPI:
+def create_app(svc_name: str, startup=None, readyz=None) -> FastAPI:
+    """readyz：可选自定义就绪校验（返回 None=就绪 / str=不就绪原因），缺省走 TiDB
+    SELECT 1（既有服务零行为变化）；iot 用于三连接校验（TiDB+Timescale+MQTT，07 号 §4.1）。"""
     app = FastAPI(title=f"HSF {svc_name}", docs_url=None, redoc_url=None)
     # 同步 resolver 跑在 starlette 线程池：默认 anyio 限 40 tokens，200VU 压测即排队成秒级尾
     # （docs/20 §3.4 复测定位）。提额到 200×4副本=800 并发容量，DB 侧由 TiDB 连接数兜底。
@@ -37,9 +39,14 @@ def create_app(svc_name: str, startup=None) -> FastAPI:
         return {"svc": svc_name, "status": "up", "uptime": int(time.time() - state["started"])}
 
     @app.get("/readyz")
-    def readyz():
+    def ready_endpoint():
         if not state["ready"]:
             return PlainTextResponse("not ready", status_code=503)
+        if readyz is not None:
+            err = readyz()
+            if err:
+                return PlainTextResponse(str(err), status_code=503)
+            return {"ready": True}
         try:
             db.query("SELECT 1")
         except Exception as e:

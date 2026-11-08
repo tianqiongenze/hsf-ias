@@ -1,0 +1,63 @@
+# HSF 二期时序库：TimescaleDB（StatefulSet 1 副本，命名空间 hsf-prod）
+# 依据：docs/07 §3.1（冻结部署事实）/§1.3（资源核算）、CONVENTIONS-P2 T-2/T-3
+# 镜像：timescale/timescaledb:2.17.2-pg16 → 本地仓库 base/timescaledb:2.17.2-pg16
+# 引导口径（docs/07 §3.1）：POSTGRES_USER=hsf / POSTGRES_DB=hsf_ts——官方镜像首次启动 initdb
+#   建库建用户，hsf 即超级用户兼业务用户，CREATE EXTENSION timescaledb 的超级用户要求随之满足；
+#   无独立超级用户凭据，StatefulSet/iot/init-ts.sh 三方共用 Secret 键 TIMESCALE_PASS（§1.4）
+# 调度：nodeSelector 固定 worker1（T-3：master requests 被租户占满，新有状态服务只允许 worker1）
+# 初始化：pod Running 后执行 scripts/init-ts.sh（全幂等，可重复执行）
+# hsf-dev 同构：sed 's/hsf-prod/hsf-dev/g' 后另行 apply（一期 20-services.yaml:6 同口径；本文件只冻结 prod）
+---
+apiVersion: v1
+kind: Service
+metadata: {name: hsf-timescale, namespace: hsf-prod, labels: {app: hsf-timescale}}
+spec:
+  type: ClusterIP
+  selector: {app: hsf-timescale}
+  # 端口名不用 http-metrics：PG 无 HTTP /metrics 端点，且 Service 不带 metrics:"true" label，
+  # 不会被 60-monitors 选中（gw/web 无 /metrics 同一例外逻辑，CONVENTIONS §2.16）
+  ports: [{name: pg, port: 5432, targetPort: 5432}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: hsf-timescale, namespace: hsf-prod, labels: {app: hsf-timescale}}
+spec:
+  serviceName: hsf-timescale
+  replicas: 1
+  selector: {matchLabels: {app: hsf-timescale}}
+  template:
+    metadata: {labels: {app: hsf-timescale}}
+    spec:
+      priorityClassName: hsf-normal
+      nodeSelector: {kubernetes.io/hostname: k8s-worker1}   # T-3：master requests 满，只允许 worker1
+      containers:
+      - name: timescaledb
+        image: 10.167.2.175:30500/base/timescaledb:2.17.2-pg16
+        ports: [{containerPort: 5432}]
+        env:
+        - {name: POSTGRES_USER, value: hsf}
+        - {name: POSTGRES_DB, value: hsf_ts}
+        - {name: POSTGRES_PASSWORD, valueFrom: {secretKeyRef: {name: hsf-secrets, key: TIMESCALE_PASS}}}
+        - {name: TZ, value: Asia/Shanghai}                  # A-04-3 全链路 Asia/Shanghai 口径
+        # PG 参数 timezone（docs/07 §3.1；args 透传给镜像入口的 postgres 进程）
+        args: ["-c", "timezone=Asia/Shanghai"]
+        resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: "2", memory: 2Gi}}   # docs/07 §1.3
+        # 探针 pg_isready（docs/07 §3.1 冻结形态；无 HTTP 端点故用 exec 探针）
+        readinessProbe:
+          exec: {command: ["pg_isready", "-U", "hsf", "-d", "hsf_ts"]}
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 12    # 首次 initdb + 崩溃恢复窗口放宽（10Gi PV 恢复可超 60s）
+        livenessProbe:
+          exec: {command: ["pg_isready", "-U", "hsf", "-d", "hsf_ts"]}
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 12    # 避免长事务/恢复期误杀（CONVENTIONS §2.14 节奏 + 故障容忍）
+        volumeMounts:
+        - {name: data, mountPath: /var/lib/postgresql/data}
+  volumeClaimTemplates:
+  - metadata: {name: data}
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: local-path
+      resources: {requests: {storage: 10Gi}}   # docs/07 §3.6 容量核算：90 天保留 + 压测余量 ≈5.5GB

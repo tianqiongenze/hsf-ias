@@ -1,6 +1,11 @@
 // HSF GraphQL 联邦网关（Apollo Gateway）——移植自 dv-ias/gw/gateway.js
-// 职责：超图组合、JWT 校验与用户头注入（防伪造）、限流（简易令牌桶）、CORS、健康检查
+// 职责：超图组合、JWT 校验与用户头注入（防伪造）、限流（HTTP 调 ratelimit-svc，fail-open）、CORS、健康检查
 // 端口：业务 8090（GraphQL）+ 独立探针 9090（/healthz，CONVENTIONS §2.5）
+// 二期限流改造（docs/07 §5.2/§5.3/§9-⑥ 冻结）：判定改由 ratelimit-svc（:8096）经 Redis Cluster
+//   全局固定窗口计数——gw 任意副本同键计数，跨副本全局一致；非 200/网络错误/500ms 超时一律
+//   fail-open 放行（节流告警日志同 key 60s 一条）；429 语义与响应体保持一期冻结形态（docs/06 P1 / V-25）。
+//   一期进程内令牌桶保留约 15 行为 RATE_MODE=local 回退路径（ratelimit-svc/Redis 故障且 fail-open
+//   不可接受时 manifest 单行切回，不改镜像；回退路径为纯进程内实现，无任何 Redis 客户端依赖）。
 // 注：sim 为 REST 服务（docs/05 §0 D-05-3，FastAPI :8095/NodePort 31211），不进联邦组合——
 //     SUBGRAPHS 默认为 iam/land/project/facility 四个 GraphQL 子图；sim 如二期 GraphQL 化再追加
 const { ApolloGateway, RemoteGraphQLDataSource } = require('@apollo/gateway');
@@ -16,7 +21,14 @@ const SUBGRAPHS = (process.env.SUBGRAPHS || [
 ].join(',')).split(',').map(s => { const [name, url] = s.split('='); return { name, url }; });
 
 const JWT_SECRET = process.env.JWT_SECRET || 'HsfJwt-2026-bN8wQ4vXzA6sD1fG';
-// 限流令牌桶容量（req/min），env RATE_CAP 可调，默认 6000（CONVENTIONS §2.6；600/min 卡死单核压测为 dv-ias 教训）
+// 限流模式开关（docs/07 §5.3 冻结）：svc=HTTP 调 ratelimit-svc（二期常态）；local=进程内桶回退
+const RATE_MODE = (process.env.RATE_MODE || 'svc').toLowerCase();
+// 限流判定服务（ratelimit-svc，CONVENTIONS-P2 T-2 冻结地址；生产由 manifest env RATE_SVC 注入）
+const RATE_SVC = process.env.RATE_SVC || 'http://ratelimit-svc.hsf-prod.svc.cluster.local:8096';
+// 超时冻结 500ms（docs/07 §5.2/§9-⑥）：同步限流检查在请求关键路径上，p95 预算 500ms 之下
+// 检查预算应 ≤10%——同命名空间 RTT <5ms，500ms 已含 100× 裕度（workflow 任务文本 5s 按此收紧）
+const RATE_TIMEOUT_MS = parseInt(process.env.RATE_TIMEOUT_MS || '500', 10) || 500;
+// 令牌桶容量：仅 RATE_MODE=local 回退模式读取（docs/07 §5.2 env 冻结表）
 const RATE_CAP = parseInt(process.env.RATE_CAP || '6000', 10) || 6000;
 
 class AuthedDataSource extends RemoteGraphQLDataSource {
@@ -36,11 +48,36 @@ class AuthedDataSource extends RemoteGraphQLDataSource {
   }
 }
 
-// 令牌桶限流（进程内，按 user.sub 或 ip 分桶）：cap=RATE_CAP/min 为单实例口径，
-// 全局容量 = cap × 实例数（一期决策：ioredis Cluster 对 hostname 广播集群存在刷新循环，
-// 详见 docs/20 §5.3 与二期 ADR；gw 实例数 3-4，全局 3600-4800/min）
+// ── RATE_MODE=svc：HTTP 调 ratelimit-svc /limit（全局固定窗口，跨副本共享）──────────
+// 非 200 / 网络错误 / 超时一律 fail-open（放行），仅以节流 console.warn 记录（同 key 60s 一条，
+// docs/07 §5.2）——限流是保护措施，其自身故障不允许放大为业务不可用（CONVENTIONS-P2 T-3）。
+// 返回 null=判定不可用（放行）；{allowed}=服务侧已扣减配额。
+const RATE_WARN_INTERVAL_MS = 60000;
+const lastRateWarnAt = new Map();  // key → 上次告警时刻；超量时整体清空防内存增长（键空间小：u:{sub}/ip:{ip}）
+async function checkRateLimit(key) {
+  try {
+    const res = await fetch(`${RATE_SVC}/limit?key=${encodeURIComponent(key)}&cost=1`,
+                            { signal: AbortSignal.timeout(RATE_TIMEOUT_MS) });
+    if (!res.ok) throw new Error(`ratelimit-svc HTTP ${res.status}`);
+    const data = await res.json();
+    if (!data || typeof data.allowed !== 'boolean') throw new Error('ratelimit-svc 响应缺少 allowed 字段');
+    return data;
+  } catch (e) {
+    const now = Date.now(), last = lastRateWarnAt.get(key) || 0;
+    if (now - last > RATE_WARN_INTERVAL_MS) {
+      if (lastRateWarnAt.size > 5000) lastRateWarnAt.clear();
+      lastRateWarnAt.set(key, now);
+      console.warn(`[ratelimit] fail-open（判定不可用，放行）：${e.message} key=${key} svc=${RATE_SVC}`);
+    }
+    return null;
+  }
+}
+
+// ── RATE_MODE=local：一期进程内令牌桶原实现（约 15 行，docs/07 §5.3 回退开关冻结保留）──
+// 按 user.sub 或 ip 分桶：cap=RATE_CAP/min 为单实例口径，全局容量 = cap × 实例数（局部口径——
+// 正因如此二期常态走 svc 模式；本路径仅供 ratelimit-svc/Redis 故障且 fail-open 不可接受时回退）
 const buckets = new Map();
-function rateLimit(key) {
+function rateLimitLocal(key) {
   const now = Date.now(), cap = RATE_CAP, refill = RATE_CAP / 60000;
   let b = buckets.get(key); if (!b) { b = { t: now, n: cap }; buckets.set(key, b); }
   b.n = Math.min(cap, b.n + (now - b.t) * refill); b.t = now;
@@ -78,14 +115,15 @@ const server = new ApolloServer({
   }).listen(9090, '0.0.0.0');
 
   // 限流/身份预中间件（express 层）：限流命中直接回 HTTP 429 + RATE_LIMITED（docs/06 P1 验收条款），
-  // 不再经 Apollo 抛错（Apollo 上下文异常统一 500，无法表达 429）——V-25 复测缺陷修复
+  // 不再经 Apollo 抛错（Apollo 上下文异常统一 500，无法表达 429）——V-25 复测缺陷修复。
+  // 429 仅由限流判定 allowed=false 触发；svc 模式判定不可用（返回 null）时放行（fail-open，§5.2）。
   const express = require('express');
   const { expressMiddleware } = require('@apollo/server/express4');
   const app = express();
   const httpServer = http.createServer(app);
   let corsFn = null; try { corsFn = require('cors'); } catch (e) { /* cors 为可选增强 */ }
   if (corsFn) app.use(corsFn());
-  app.use('/', (req, res, next) => {
+  app.use('/', async (req, res, next) => {
     const ip = (req.socket && req.socket.remoteAddress) || 'anon';
     const auth = req.headers.authorization || '';
     let user = null;
@@ -93,8 +131,16 @@ const server = new ApolloServer({
       try { user = jwt.verify(auth.slice(7), JWT_SECRET, { algorithms: ['HS256'] }); }
       catch { user = null; }
     }
+    // 限流键口径不变（CONVENTIONS §2.6 / 05 §1.4）：登录按 user.sub、匿名按 ip 分键
     const key = user ? `u:${user.sub}` : `ip:${ip}`;
-    if (!rateLimit(key)) {
+    let denied = false;
+    if (RATE_MODE === 'local') {
+      denied = !rateLimitLocal(key);              // 回退路径：进程内令牌桶（局部口径）
+    } else {
+      const verdict = await checkRateLimit(key);  // 二期常态：ratelimit-svc 全局固定窗口
+      denied = verdict ? verdict.allowed === false : false;
+    }
+    if (denied) {
       res.status(429).set('content-type', 'application/json')
          .end(JSON.stringify({ errors: [{ message: '请求过于频繁，请稍后再试', extensions: { code: 'RATE_LIMITED' } }] }));
       return;
@@ -116,5 +162,7 @@ const server = new ApolloServer({
   }));
   await new Promise((resolve) => httpServer.listen(8090, '0.0.0.0', resolve));
   gatewayReady = true;
-  console.log(`HSF gateway ready at http://0.0.0.0:8090/, rate_cap=${RATE_CAP}/min, subgraphs: ${SUBGRAPHS.map(s => s.name).join(',')}`);
+  console.log(`HSF gateway ready at http://0.0.0.0:8090/, rate_mode=${RATE_MODE}` +
+              (RATE_MODE === 'svc' ? ` svc=${RATE_SVC} (fail-open, timeout ${RATE_TIMEOUT_MS}ms)` : ` (in-process bucket, cap=${RATE_CAP}/min per instance)`) +
+              `, subgraphs: ${SUBGRAPHS.map(s => s.name).join(',')}`);
 })();

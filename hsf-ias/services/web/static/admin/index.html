@@ -58,6 +58,7 @@ input,select,textarea{padding:10px;border:1px solid var(--line);border-radius:9p
       <div onclick="pg('fac',this)">🚰 设施台账</div>
       <div onclick="pg('wo',this)">🔧 工单处置</div>
       <div onclick="pg('alert',this)">📣 告警列表</div>
+      <div onclick="pg('iot',this)">📡 设备与墒情</div>
     </div>
     <div class="main">
       <section id="p-dash">
@@ -124,6 +125,27 @@ input,select,textarea{padding:10px;border:1px solid var(--line);border-radius:9p
         <div class="note">告警处置流转（handle/close）接口二期开放（docs/05 A-05-2），本期只读；数据源 sim REST。</div>
         </div>
       </section>
+      <section id="p-iot" style="display:none">
+        <div class="panel"><h3>灌溉建议（墒情 &lt;40% 自动生成，6h 窗口去重，docs/07 §4.3）
+          <select id="fAdState" style="width:110px;display:inline-block;margin-left:12px" onchange="loadAdvice()"><option value="">全部状态</option><option value="OPEN">待处置</option><option value="CLOSED">已闭环</option></select>
+          <button class="act" style="float:right" onclick="loadAdvice()">刷新</button></h3>
+        <table><thead><tr><th>编号</th><th>地块</th><th>触发传感器</th><th>触发墒情</th><th>建议灌溉量（m³/亩）</th><th>地块面积（亩）</th><th>总灌溉量（m³）</th><th>状态</th><th>生成时间</th></tr></thead><tbody id="adBody"></tbody></table>
+        <div class="note">建议量为决策参考值（M=667×h×γ×(θfc−θ)/100），实际灌溉由村管护员按墒情与经验修正；墒情回升 ≥55% 自动闭环。</div>
+        </div>
+        <div class="panel"><h3>传感器最新值（iot latest 缓存）
+          <button class="act" style="float:right" onclick="loadIotLatest()">刷新</button></h3>
+        <div id="iotLatest" style="display:flex;flex-wrap:wrap;gap:8px"><span class="tag g">加载中…</span></div>
+        </div>
+        <div class="panel"><h3>设备列表（墒情/气象/虫情/水位 48 台）
+          <select id="fIotVillage" style="width:120px;display:inline-block;margin-left:12px" onchange="loadIotDevices()"><option value="">全部村</option></select>
+          <select id="fIotMetric" style="width:120px;display:inline-block;margin-left:6px" onchange="loadIotDevices()"><option value="">全部指标</option></select></h3>
+        <table><thead><tr><th>设备编码</th><th>指标</th><th>村</th><th>绑定地块</th><th>状态</th><th>最新值</th><th>上报时间</th></tr></thead><tbody id="dvBody"></tbody></table>
+        </div>
+        <div class="panel"><h3>iot 告警（规则引擎已随 iot 服务承接，docs/07 §4.2）
+          <select id="fIotAlertState" style="width:110px;display:inline-block;margin-left:12px" onchange="loadIotAlerts()"><option value="">全部状态</option><option value="OPEN">未处置</option><option value="PROCESSING">处置中</option><option value="CLOSED">已关闭</option></select></h3>
+        <table><thead><tr><th>编号</th><th>传感器</th><th>规则</th><th>指标</th><th>触发值</th><th>触发时间</th><th>村</th><th>状态</th></tr></thead><tbody id="iaBody"></tbody></table>
+        </div>
+      </section>
     </div>
   </div>
 </div>
@@ -134,7 +156,7 @@ input,select,textarea{padding:10px;border:1px solid var(--line);border-radius:9p
 </div></div>
 <script src="/js/gql.js"></script>
 <script>
-// 管理端：项目 7 态流转 + 设施台账 + 工单 4 步闭环 + sim 告警（REST 经 web 同源代理）
+// 管理端：项目 7 态流转 + 设施台账 + 工单 4 步闭环 + sim 告警 + 二期设备与墒情/灌溉建议（REST 经 web 同源代理 /sim、/iot）
 let WO_ID=null, KEEPERS=[];
 const NEXT={
   RESERVED:{label:'提交申报',cls:'',q:'mutation($c:String!){submitProject(code:$c){code state}}'},
@@ -157,8 +179,8 @@ async function doLogin(){
 
 function pg(p,el){
   document.querySelectorAll('.nav div').forEach(x=>x.classList.remove('on'));el.classList.add('on');
-  ['dash','proj','fac','wo','alert'].forEach(s=>document.getElementById('p-'+s).style.display=s===p?'block':'none');
-  ({dash:loadDash,proj:()=>{loadProjects();ensureProjForm();},fac:loadFacilities,wo:loadWorkorders,alert:loadAlerts})[p]();
+  ['dash','proj','fac','wo','alert','iot'].forEach(s=>document.getElementById('p-'+s).style.display=s===p?'block':'none');
+  ({dash:loadDash,proj:()=>{loadProjects();ensureProjForm();},fac:loadFacilities,wo:loadWorkorders,alert:loadAlerts,iot:loadIot})[p]();
 }
 
 async function boot(){
@@ -167,6 +189,9 @@ async function boot(){
   Object.entries(FACILITY_TYPE).forEach(([k,v])=>fFType.insertAdjacentHTML('beforeend',`<option value="${k}">${v}</option>`));
   Object.entries(FACILITY_STATUS).forEach(([k,v])=>fFStatus.insertAdjacentHTML('beforeend',`<option value="${k}">${v}</option>`));
   Object.entries(WORKORDER_STATE).forEach(([k,v])=>fWoState.insertAdjacentHTML('beforeend',`<option value="${k}">${v}</option>`));
+  // 二期：设备与墒情页签下拉（村/指标）
+  VILLAGES.forEach(([c,n])=>fIotVillage.insertAdjacentHTML('beforeend',`<option value="${c}">${n}</option>`));
+  Object.entries(METRIC_NAME).forEach(([k,v])=>fIotMetric.insertAdjacentHTML('beforeend',`<option value="${k}">${v}</option>`));
   loadDash();
 }
 
@@ -325,6 +350,50 @@ async function loadAlerts(){
     ruleChips.innerHTML=st.items.map(x=>`<span class="tag ${x.key==='RULE_DROUGHT'||x.key==='RULE_PEST'?'w':''}" style="margin-right:8px">${RULE_NAME[x.key]||x.key} ${x.count}</span>`).join('')||'<span class="tag g">暂无告警</span>';
     alBody.innerHTML=d.items.map(a=>`<tr><td>#${a.id}</td><td>${esc(a.sensorCode)}</td><td>${RULE_NAME[a.ruleCode]||esc(a.ruleCode)}</td><td>${METRIC_NAME[a.metric]||esc(a.metric)}</td><td><b>${a.trigValue}</b></td><td>${(a.trigTime||'').slice(5,16).replace('T',' ')}</td><td>${vName(a.villageCode)}</td><td><span class="tag ${a.state==='OPEN'?'r':a.state==='PROCESSING'?'w':'g'}">${ALERT_STATE[a.state]||a.state}</span></td></tr>`).join('')||'<tr><td colspan="8">暂无告警</td></tr>';
   }catch(e){alBody.innerHTML=`<tr><td colspan="8">${esc(e.message)}</td></tr>`}
+}
+
+// ── 设备与墒情（二期 iot REST：/iot/devices /sensor/latest /alerts /irrigation-advice，
+//    全部经 web 同源反代 /iot/，docs/07 §4.6/§4.7）──
+function loadIot(){ loadAdvice(); loadIotLatest(); loadIotDevices(); loadIotAlerts(); }
+
+async function loadAdvice(){
+  try{
+    const d=await iot('/irrigation-advice',{state:fAdState.value,page:1,size:20});
+    adBody.innerHTML=d.items.map(a=>`<tr><td>#${a.id}</td><td>${esc(a.parcelCode)}</td><td>${esc(a.sensorCode)}</td>
+      <td><b style="color:#C62828">${a.triggerValue}%</b></td><td>${a.perMuM3}</td><td>${a.areaMu!=null?a.areaMu:'—'}</td>
+      <td>${a.totalM3!=null?a.totalM3:'—'}</td>
+      <td><span class="tag ${a.state==='OPEN'?'w':''}">${ADVICE_STATE[a.state]||a.state}</span></td>
+      <td>${(a.createdAt||'').slice(5,16).replace('T',' ')}</td></tr>`).join('')||'<tr><td colspan="9">暂无灌溉建议（墒情低于 40% 时自动生成）</td></tr>';
+  }catch(e){adBody.innerHTML=`<tr><td colspan="9">${esc(e.message)}</td></tr>`}
+}
+
+async function loadIotLatest(){
+  try{
+    const d=await iot('/sensor/latest',{villageCode:fIotVillage.value});
+    iotLatest.innerHTML=(d.items||[]).map(x=>`<span class="tag" title="${esc(x.sensorCode)} ${(x.recordedAt||'').replace('T',' ')}">${esc(x.sensorCode.slice(-4))}·${METRIC_NAME[x.metric]||esc(x.metric)} <b>${x.value!=null?x.value:'—'}</b></span>`).join('')||'<span class="tag g">暂无读数（可执行 POST /sim/tick 触发）</span>';
+  }catch(e){iotLatest.innerHTML='<span class="tag r">'+esc(e.message)+'</span>'}
+}
+
+async function loadIotDevices(){
+  try{
+    const d=await iot('/devices',{villageCode:fIotVillage.value,metric:fIotMetric.value,page:1,size:100});
+    dvBody.innerHTML=d.items.map(s=>`<tr><td>${esc(s.sensorCode)}</td><td>${METRIC_NAME[s.metric]||esc(s.metric)}</td>
+      <td>${vName(s.villageCode)}</td><td>${s.parcelCode?esc(s.parcelCode):'—'}</td>
+      <td><span class="tag ${s.status==='ACTIVE'?'':'g'}">${SENSOR_STATUS[s.status]||s.status}</span></td>
+      <td><b>${s.lastValue!=null?s.lastValue:'—'}</b></td>
+      <td>${(s.lastRecordedAt||'').slice(5,19).replace('T',' ')||'—'}</td></tr>`).join('')
+      ||`<tr><td colspan="7">暂无设备（共 ${d.total} 台）</td></tr>`;
+  }catch(e){dvBody.innerHTML=`<tr><td colspan="7">${esc(e.message)}</td></tr>`}
+}
+
+async function loadIotAlerts(){
+  try{
+    const d=await iot('/alerts',{state:fIotAlertState.value,page:1,size:20});
+    iaBody.innerHTML=d.items.map(a=>`<tr><td>#${a.id}</td><td>${esc(a.sensorCode)}</td><td>${RULE_NAME[a.ruleCode]||esc(a.ruleCode)}</td>
+      <td>${METRIC_NAME[a.metric]||esc(a.metric)}</td><td><b>${a.trigValue}</b></td>
+      <td>${(a.trigTime||'').slice(5,16).replace('T',' ')}</td><td>${vName(a.villageCode)}</td>
+      <td><span class="tag ${a.state==='OPEN'?'r':a.state==='PROCESSING'?'w':'g'}">${ALERT_STATE[a.state]||a.state}</span></td></tr>`).join('')||'<tr><td colspan="8">暂无告警</td></tr>';
+  }catch(e){iaBody.innerHTML=`<tr><td colspan="8">${esc(e.message)}</td></tr>`}
 }
 </script>
 </body>

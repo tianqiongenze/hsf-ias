@@ -1,4 +1,8 @@
-"""HSF sim-svc：IoT 模拟与时序告警（:8095，REST 非 GraphQL——05 号 §7/D-05-3）。
+"""HSF sim-svc：IoT 模拟设备与读数发布（:8095，REST 非 GraphQL——05 号 §7/D-05-3，二期 2.0）。
+
+二期职责（docs/07 §2.5 冻结）：只"造数与发数"——MQTT 发布器（paho-mqtt 连 hsf-mqtt，
+心跳 MQTT_INTERVAL=2s/轮 48 条）+ `POST /sim/tick` 批量触发同步发布（响应含 published
+条数）+ 设备台账 seed。一期规则引擎/时序写入职责已移交 iot 服务（:8097）。
 
 鉴权复用同一 JWT（Authorization: Bearer，HS256）；错误码 HTTP 映射见 05 号 §2.1。
 机器/脚本流量直连（NodePort 31211），一期不做端点级限流（评审 R10）。
@@ -14,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from hsf_common.web import create_app
 
-from app import repo
+from . import mqtt_pub, repo
 
 app = create_app("sim")
 # CORS 允许 web 源（03 号 §4.5 端点表；一期局域网内网，env 可收紧）
@@ -30,6 +34,13 @@ try:
 except Exception:
     _ISSUER_SECRET = ""
 JWT_SECRET = os.environ.get("JWT_SECRET") or _ISSUER_SECRET
+
+MQTT_HOST = os.environ.get("MQTT_HOST", "hsf-mqtt")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
+MQTT_USER = os.environ.get("MQTT_USER", "hsf")
+MQTT_PASS = os.environ.get("MQTT_PASS", "")
+
+publisher: mqtt_pub.MqttPublisher | None = None
 
 
 def _http_err(status: int, code: str, msg: str) -> HTTPException:
@@ -54,20 +65,33 @@ def _page(page: int, size: int) -> tuple[int, int]:
     return max(page, 1), min(max(size, 1), 100)
 
 
-@app.on_event("startup")
-def _init():
+def _startup():
+    global publisher
     repo.init_db()
-    repo.seed_if_empty()  # 48 台设备 + 4 条规则 + 4 规则各 1 条种子告警（幂等双守卫）
+    repo.seed_if_empty()  # 48 台设备（幂等双守卫；alert_rule/种子告警已移交 iot）
+    publisher = mqtt_pub.MqttPublisher(repo.heartbeat_readings, MQTT_HOST, MQTT_PORT,
+                                       MQTT_USER, MQTT_PASS)
+    publisher.start()
 
 
-# ── 端点 1：POST /sim/tick（FR-502）────────────────────────────────────────
+app.add_event_handler("startup", _startup)
+
+
+# ── 端点 1：POST /sim/tick（FR-502，二期形态：批量触发 MQTT 同步发布）─────────────
 
 @app.post("/sim/tick")
 def sim_tick(steps: int = 1, user: dict = Depends(require_login)):
-    return repo.tick(steps)
+    """steps 轮 × 48 台 → MQTT QoS1 发布 → 返回 published 条数（docs/07 §2.5）。
+
+    broker 未连接时 published=0 且 mqtt_connected=false（HTTP 仍 200，k6 iot-write
+    场景以 published 换算吞吐，07 号 §6.3）。"""
+    readings = repo.generate_readings(steps)
+    published = publisher.publish_readings(readings) if publisher else 0
+    return {"published": int(published), "steps": len(readings),
+            "mqtt_connected": bool(publisher.is_connected()) if publisher else False}
 
 
-# ── 端点 2：GET /sim/sensors（FR-501）──────────────────────────────────────
+# ── 端点 2：GET /sim/sensors（FR-501）─────────────────────────────────────────────
 
 @app.get("/sim/sensors")
 def sim_sensors(villageCode: str | None = None, metric: str | None = None,
@@ -76,14 +100,14 @@ def sim_sensors(villageCode: str | None = None, metric: str | None = None,
     return repo.sensors_list(villageCode, metric, page, size)
 
 
-# ── 端点 3：GET /sim/latest（FR-502③，快路径读 sensor.last_*）────────────────
+# ── 端点 3：GET /sim/latest（FR-502③，快路径读 sensor.last_*——二期由 iot 维护）────
 
 @app.get("/sim/latest")
 def sim_latest(villageCode: str | None = None, user: dict = Depends(require_login)):
     return repo.latest(villageCode)
 
 
-# ── 端点 4：GET /sim/alerts（FR-504）───────────────────────────────────────
+# ── 端点 4：GET /sim/alerts（FR-504，一期冻结契约保留为只读；写入方=iot）───────────
 
 @app.get("/sim/alerts")
 def sim_alerts(state: str | None = None, villageCode: str | None = None,
@@ -92,7 +116,7 @@ def sim_alerts(state: str | None = None, villageCode: str | None = None,
     return repo.alerts_list(state, villageCode, page, size)
 
 
-# ── 端点 5：GET /sim/alerts/statistics（FR-505）────────────────────────────
+# ── 端点 5：GET /sim/alerts/statistics（FR-505）───────────────────────────────────
 
 @app.get("/sim/alerts/statistics")
 def sim_alerts_statistics(dim: str = "state", villageCode: str | None = None,
@@ -104,7 +128,7 @@ def sim_alerts_statistics(dim: str = "state", villageCode: str | None = None,
 
 
 # ── 兼容别名（workflow 任务口径 GET /alerts、/alerts/statistics、/sensor/latest；
-#    正式契约 = 05 号 §7.1 冻结端点，本组别名仅为任务文本对齐）───────────────────
+#    正式契约 = 05 号 §7.1 冻结端点，本组别名仅为任务文本对齐）───────────────────────
 
 @app.get("/alerts")
 def alerts_alias(state: str | None = None, villageCode: str | None = None,
