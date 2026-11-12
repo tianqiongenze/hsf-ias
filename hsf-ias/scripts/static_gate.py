@@ -43,7 +43,8 @@ EXT_WEB = {".html", ".js", ".css", ".py", ".ts"}  # CDN 规则
 
 # 四子图 federation schema 检查路径（相对仓库根）
 SUBGRAPH_SCHEMAS = ["services/iam/app/schema.py", "services/land/app/schema.py",
-                    "services/project/app/schema.py", "services/facility/app/schema.py"]
+                    "services/project/app/schema.py", "services/facility/app/schema.py",
+                    "services/rs/app/main.py"]   # 三期 rs 子图内嵌 main.py（联邦 _service 契约防回归）
 
 CDN_PATTERNS = [
     "unpkg.com", "cdn.jsdelivr.net", "cdnjs.cloudflare.com", "ajax.googleapis.com",
@@ -70,6 +71,14 @@ P2_ENDPOINTS = ("/healthz", "/readyz", "/metrics")   # CONVENTIONS §2.14 / docs
 P2_RULE_SYMBOLS_RE = re.compile(
     r"\b(RULE_DROUGHT|RULE_WATERLOGGING|RULE_GALE|RULE_PEST)\b")
 P2_E2E_MIN = 17        # docs/07 §6.1：一期 13 条全保留 + 新增 6 条 = 19 ≥ 17
+
+# ── 三期检查项常量（docs/08 §7；CONVENTIONS-P3 U/V/X）──────────────────────────
+P3_NEW_SVCS = ("rs", "uplink")            # U-1：三期新增服务
+P3_REBUILD_SVCS = ("gw", "sim", "iot", "web", "rs", "uplink")   # U-2：3.0 镜像集
+P3_E2E_MIN = 25                           # X-1：一期 13 + 二期 6 + 三期 6
+P3_DL_RE = re.compile(                    # V-1 红线：rs 禁深度学习推理依赖
+    r"\b(import\s+torch|from\s+torch|import\s+tensorflow|from\s+tensorflow|"
+    r"['\"]torch['\"]|['\"]tensorflow['\"]|onnxruntime|paddle)")
 
 
 def iter_files(root: Path):
@@ -230,15 +239,103 @@ def check_gw_rate_env(root: Path, findings: list):
 
 
 def check_e2e_count(root: Path, findings: list):
-    """§6.4⑥：E2E 用例数 ≥17（rec(name,...) 首参去重计数——try/except 同名重复合并为同一用例）。"""
+    """§6.4⑥/X-3：E2E 用例数 ≥25（rec(name,...) 首参去重计数——try/except 同名重复合并为同一用例）。
+    三期提高下限（CONVENTIONS-P3 X-1：一期 13 + 二期 6 + 三期 6 = 25）。"""
     p = root / "test" / "e2e_browser.py"
     if not p.is_file():
-        findings.append(("E2E<17", "test/e2e_browser.py:0", "E2E 脚本缺失"))
+        findings.append(("E2E<25", "test/e2e_browser.py:0", "E2E 脚本缺失"))
         return
     names = set(re.findall(r'rec\(\s*"([^"]+)"', p.read_text(encoding="utf-8", errors="ignore")))
-    if len(names) < P2_E2E_MIN:
-        findings.append(("E2E<17", "test/e2e_browser.py:0",
-                         f"用例数={len(names)}（要求 ≥{P2_E2E_MIN}，docs/07 §6.1：一期 13 条全保留 + 新增 6 条）"))
+    if len(names) < P3_E2E_MIN:
+        findings.append(("E2E<25", "test/e2e_browser.py:0",
+                         f"用例数={len(names)}（要求 ≥{P3_E2E_MIN}，CONVENTIONS-P3 X-1：一期 13 + 二期 6 + 三期 6）"))
+
+
+def check_p3_new_services(root: Path, findings: list):
+    """X-3③：三期新服务（rs/uplink）代码必含探针三件套 + Dockerfile；
+    k8s 清单 workload 必存在且含探针与 limits（沿用 P2④ 口径）。"""
+    for svc in P3_NEW_SVCS:
+        base = root / "services" / svc
+        if not base.is_dir():
+            findings.append(("三期新服务缺探针/limits", f"services/{svc}:0",
+                             "三期服务目录缺失（CONVENTIONS-P3 U-1）"))
+            continue
+        text = _dir_text(base)
+        for ep in P2_ENDPOINTS:
+            if ep not in text:
+                findings.append(("三期新服务缺探针/limits", f"services/{svc}:0",
+                                 f"代码未含 {ep}（CONVENTIONS §2.14）"))
+        if not (base / "Dockerfile").is_file():
+            findings.append(("三期新服务缺探针/limits", f"services/{svc}:0",
+                             "Dockerfile 缺失（U-2：3.0 镜像构建前提）"))
+        found = False
+        for yml in sorted((root / "k8s").glob("*.yaml")):
+            text = yml.read_text(encoding="utf-8", errors="ignore")
+            for doc in re.split(r"(?m)^---\s*$", text):
+                if not re.search(r"kind:\s*(Deployment|StatefulSet)\b", doc):
+                    continue
+                if not re.search(r"(?:name|image):\s*\S*" + svc + r"(-svc)?\b", doc):
+                    continue
+                found = True
+                for req, hint in (("readinessProbe", "readiness 探针"),
+                                  ("livenessProbe", "liveness 探针"),
+                                  ("limits:", "resources.limits")):
+                    if req not in doc:
+                        findings.append(("三期新服务缺探针/limits", f"{yml}:0",
+                                         f"{svc} workload 缺 {hint}（CONVENTIONS §2.14/§2.15）"))
+        if not found:
+            findings.append(("三期新服务缺探针/limits", "k8s:0",
+                             f"k8s 清单缺 {svc} workload（docs/08 §6：20-services.yaml 增量必含）"))
+
+
+def check_rs_pure_cpu(root: Path, findings: list):
+    """X-3①/V-1 红线：rs 必含 numpy 且全仓 rs 代码禁用 torch/tensorflow/模型推理依赖。"""
+    base = root / "services" / "rs"
+    if not base.is_dir():
+        findings.append(("rs缺numpy或含DL依赖", "services/rs:0", "rs 目录缺失（U-1）"))
+        return
+    text = _dir_text(base)
+    if "numpy" not in text:
+        findings.append(("rs缺numpy或含DL依赖", "services/rs:0",
+                         "未含 numpy（V-1：NDVI 数值计算唯一依赖）"))
+    for p in sorted(base.rglob("*.py")):
+        if "__pycache__" in p.parts:
+            continue
+        for lineno, line in enumerate(p.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+            if P3_DL_RE.search(line):
+                findings.append(("rs缺numpy或含DL依赖", f"{p}:{lineno}", line.strip()[:120]))
+    req = base / "requirements.txt"
+    if req.is_file() and P3_DL_RE.search(req.read_text(encoding="utf-8", errors="ignore")):
+        findings.append(("rs缺numpy或含DL依赖", f"{req}:0", "requirements 含 torch/tensorflow（V-1 红线）"))
+
+
+def check_uplink_transport(root: Path, findings: list):
+    """X-3②/V-3 红线：uplink 必含 transport.py 隔离层（stub/真实平台唯一替换点）与 StubTransport 实现。"""
+    base = root / "services" / "uplink"
+    if not base.is_dir():
+        findings.append(("uplink缺transport隔离层", "services/uplink:0", "uplink 目录缺失（U-1）"))
+        return
+    if not (base / "app" / "transport.py").is_file():
+        findings.append(("uplink缺transport隔离层", "services/uplink:0",
+                         "app/transport.py 缺失（V-3：transport 为真实平台唯一替换点）"))
+    text = _dir_text(base)
+    if "StubTransport" not in text:
+        findings.append(("uplink缺transport隔离层", "services/uplink:0",
+                         "未含 StubTransport（V-3：内网口径的确定性回执实现）"))
+
+
+def check_manifest_p3_tags(root: Path, findings: list):
+    """X-3④/U-2：20-services.yaml 中三期重建镜像（gw/sim/iot/web/rs/uplink）必须 tag=3.0。"""
+    yml = root / "k8s" / "20-services.yaml"
+    if not yml.is_file():
+        findings.append(("三期tag不一致", "k8s/20-services.yaml:0", "清单文件缺失"))
+        return
+    text = yml.read_text(encoding="utf-8", errors="ignore")
+    for svc in P3_REBUILD_SVCS:
+        hits = re.findall(r"hsf/%s:([\w.]+)" % svc, text)
+        if not hits or any(not h.startswith("3.0") for h in hits):   # 3.0 主口径 + 修复 patch（3.0.1…）均合规
+            findings.append(("三期tag不一致", "k8s/20-services.yaml:0",
+                             f"hsf/{svc} 镜像 tag 非 3.0（实测 {hits or '缺失'}，U-2）"))
 
 
 def main():
@@ -258,6 +355,10 @@ def main():
     check_p2_new_services(root, findings)
     check_gw_rate_env(root, findings)
     check_e2e_count(root, findings)
+    check_p3_new_services(root, findings)
+    check_rs_pure_cpu(root, findings)
+    check_uplink_transport(root, findings)
+    check_manifest_p3_tags(root, findings)
 
     for rule, loc, snippet in findings:
         print("VIOLATION | %-24s | %s | %s" % (rule, loc, snippet))

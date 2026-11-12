@@ -31,6 +31,20 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
     }
 
+    # rs REST 同源代理（三期 docs/08 §2.4：影像/长势/预警；浏览器 /rs/vigor → rs /vigor）
+    location /rs/ {
+        proxy_pass http://${RS_UPSTREAM}/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    # uplink REST 同源代理（三期 docs/08 §3.2：上报任务；浏览器 /uplink/tasks → uplink /tasks）
+    location /uplink/ {
+        proxy_pass http://${UPLINK_UPSTREAM}/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
     # HTML 不缓存（演示期改动即时生效），vendored 库可缓存
     location ~* \.html$ { add_header Cache-Control "no-cache"; }
     location /vendor/ { add_header Cache-Control "public, max-age=86400"; }

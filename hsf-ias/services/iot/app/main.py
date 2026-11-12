@@ -152,3 +152,28 @@ def notify_read(notify_id: int, user: dict = Depends(require_login)):
     if err:
         raise _http_err(403, "FORBIDDEN", "无权限操作该通知")
     return result
+
+
+# ── 端点 7：POST /devices/register（三期 docs/08 §4 设备接入框架，D-08-4）────────
+
+@app.post("/devices/register")
+def devices_register(body: dict, user: dict = Depends(require_login)):
+    if "admin" not in (user.get("roles") or []):
+        raise _http_err(403, "FORBIDDEN", "仅县管理员可注册设备")
+    device_code = str(body.get("deviceCode") or "").strip()
+    metric = str(body.get("metric") or "").strip()
+    village_code = str(body.get("villageCode") or "").strip()
+    parcel_code = (str(body.get("parcelCode") or "").strip() or None)
+    if not device_code or not metric or not village_code:
+        raise _http_err(400, "INVALID_ARGUMENT", "缺少 deviceCode/metric/villageCode")
+    if metric not in ("soil_moisture", "air_temp", "wind_speed", "rainfall",
+                      "pest_index", "water_level"):
+        raise _http_err(400, "INVALID_ARGUMENT", "metric 不在 04 §4.7 冻结 6 类之内")
+    result = repo.register_device(device_code, metric, village_code, parcel_code)
+    if result is None:
+        raise _http_err(409, "CONFLICT", f"设备已注册（台账或凭证存在）：{device_code}")
+    try:
+        registry.maybe_refresh(force=True)   # 新设备立即进台账镜像（免等 60s 周期）
+    except TypeError:
+        registry.refresh()                   # 兼容无 force 参数签名
+    return result

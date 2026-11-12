@@ -22,11 +22,18 @@ data:
     persistence true
     persistence_location /mosquitto/data/
     max_queued_messages 10000
-    max_inflight_messages 100
+    # W-1（docs/08 §5）：100→1000 与 sim 侧 max_inflight_messages_set(1000) 匹配——
+    # iot-write 批量 tick 的 QoS1 同步发布吞吐瓶颈（2.4 万条/迭代 p95 8.29s→预期降一个量级）；
+    # mosquitto 上限 65535，1000 为设备接入框架（docs/08 §4）预留的并发窗口
+    max_inflight_messages 1000
   acl: |
-    # sim 发布（pub）/iot 订阅（sub）共用 hsf 账号；下行 topic hsf/cmd/# 三期再放
+    # sim 发布（pub）iot 订阅（sub）共用 hsf 账号；下行行 topic hsf/cmd/# 三期内不放开
     user hsf
     topic readwrite hsf/sensor/#
+    # 设备接入框架（docs/08 §4，CONVENTIONS-P3）：真实设备以 deviceCode 作为 MQTT username 登录，
+    # pattern 行保证每设备仅能读写自身 topic（%u=username 展开）；凭证经 POST /devices/register
+    # 下发，passwd 追加走 scripts/dep-device.sh（mosquitto_passwd + broker 滚动，运行时自动同步三期后补）
+    pattern readwrite hsf/sensor/%u/#
 ---
 apiVersion: v1
 kind: Service

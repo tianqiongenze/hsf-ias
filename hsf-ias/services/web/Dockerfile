@@ -14,7 +14,9 @@ RUN mkdir -p /usr/share/nginx/html/vendor \
 # 二期增量 IOT_UPSTREAM（docs/07 §4.7：默认值同法 + manifest env 显式声明，缺省时 envsubst 渲染空上游会致 nginx 拒启）
 ENV GW_UPSTREAM=gw-svc.hsf-prod.svc.cluster.local:8090 \
     SIM_UPSTREAM=sim-svc.hsf-prod.svc.cluster.local:8095 \
-    IOT_UPSTREAM=iot-svc.hsf-prod.svc.cluster.local:8097
+    IOT_UPSTREAM=iot-svc.hsf-prod.svc.cluster.local:8097 \
+    RS_UPSTREAM=rs-svc.hsf-prod.svc.cluster.local:8098 \
+    UPLINK_UPSTREAM=uplink-svc.hsf-prod.svc.cluster.local:8099
 
 COPY services/web/nginx.conf.template /etc/nginx/templates/default.conf.template
 COPY services/web/static/ /usr/share/nginx/html/

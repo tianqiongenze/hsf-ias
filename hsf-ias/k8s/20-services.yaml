@@ -27,12 +27,12 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: gw}}}
       containers:
       - name: gw
-        image: 10.167.2.175:30500/hsf/gw:2.0
+        image: 10.167.2.175:30500/hsf/gw:3.0
         ports: [{containerPort: 8090}, {containerPort: 9090}]
         env:
         - {name: JWT_SECRET, valueFrom: {secretKeyRef: {name: hsf-secrets, key: JWT_SECRET}}}
         - name: SUBGRAPHS
-          value: "iam=http://iam-svc.hsf-prod.svc.cluster.local:8091/graphql,land=http://land-svc.hsf-prod.svc.cluster.local:8092/graphql,project=http://project-svc.hsf-prod.svc.cluster.local:8093/graphql,facility=http://facility-svc.hsf-prod.svc.cluster.local:8094/graphql"
+          value: "iam=http://iam-svc.hsf-prod.svc.cluster.local:8091/graphql,land=http://land-svc.hsf-prod.svc.cluster.local:8092/graphql,project=http://project-svc.hsf-prod.svc.cluster.local:8093/graphql,facility=http://facility-svc.hsf-prod.svc.cluster.local:8094/graphql,rs=http://rs-svc.hsf-prod.svc.cluster.local:8098/graphql"
         # 二期限流改造（docs/07 §5.2/§5.3 env 冻结表）：判定移至 ratelimit-svc（Redis 固定窗口全局计数），
         # gw 只做 HTTP 调用 fail-open（非 200/网络错误/500ms 超时=放行+节流告警日志，同 key 60s 一条）
         - {name: RATE_MODE, value: "svc"}   # svc=调 ratelimit-svc（二期常态）；local=一期进程内桶回退开关
@@ -210,7 +210,7 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: sim-svc}}}
       containers:
       - name: app
-        image: 10.167.2.175:30500/hsf/sim:2.0
+        image: 10.167.2.175:30500/hsf/sim:3.0
         ports: [{containerPort: 8095}]
         envFrom: [{secretRef: {name: hsf-secrets}}]
         env:
@@ -247,7 +247,7 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: web}}}
       containers:
       - name: app
-        image: 10.167.2.175:30500/hsf/web:2.0
+        image: 10.167.2.175:30500/hsf/web:3.0
         ports: [{containerPort: 80}]
         resources: {requests: {cpu: 150m, memory: 256Mi}, limits: {cpu: "1", memory: 512Mi}}
         readinessProbe: {httpGet: {path: /, port: 80}, periodSeconds: 5}
@@ -318,7 +318,7 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: iot-svc}}}
       containers:
       - name: app
-        image: 10.167.2.175:30500/hsf/iot:2.0.6
+        image: 10.167.2.175:30500/hsf/iot:3.0
         ports: [{containerPort: 8097}]
         envFrom: [{secretRef: {name: hsf-secrets}}]   # DB_*/REDIS_*/MQTT_PASS/TIMESCALE_PASS 全量注入（§1.4）
         env:
@@ -339,3 +339,71 @@ spec:
   type: NodePort
   selector: {app: iot-svc}
   ports: [{name: http-metrics, port: 8097, targetPort: 8097, nodePort: 31213}]
+---
+# ─── rs-svc（三期新增，docs/08 §2/§6）：遥感登记+NDVI CPU 解译+长势+非农化预警（:8098，NodePort 31214）───
+# V-1 红线：numpy 纯 CPU 解译，无 torch/tf；单副本固定（同步解译、无进程内可变状态——保守口径）
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: rs-svc, namespace: hsf-prod, labels: {app: rs-svc}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: rs-svc}}
+  template:
+    metadata: {labels: {app: rs-svc}}
+    spec:
+      priorityClassName: hsf-normal
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: rs-svc}}}
+      containers:
+      - name: app
+        image: 10.167.2.175:30500/hsf/rs:3.0.1
+        ports: [{containerPort: 8098}]
+        envFrom: [{secretRef: {name: hsf-secrets}}]   # JWT_SECRET/DB_*（seed 与解译写 TiDB）
+        resources: {requests: {cpu: 150m, memory: 384Mi}, limits: {cpu: "1", memory: 1Gi}}   # numpy 峰值内存放宽
+        readinessProbe: {httpGet: {path: /readyz, port: 8098}, periodSeconds: 5, failureThreshold: 3}
+        livenessProbe: {httpGet: {path: /healthz, port: 8098}, initialDelaySeconds: 20, periodSeconds: 10}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: rs-svc, namespace: hsf-prod, labels: {app: rs-svc, metrics: "true"}}
+spec:
+  type: NodePort
+  selector: {app: rs-svc}
+  ports: [{name: http-metrics, port: 8098, targetPort: 8098, nodePort: 31214}]
+---
+# ─── uplink-svc（三期新增，docs/08 §3/§6）：上级平台上报通道（:8099，ClusterIP 不出集群网）───
+# V-3 红线：transport.py 为真实平台唯一替换点（stub 回执）；无 NodePort（仅 web 同源反代 + 内部调用）
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: uplink-svc, namespace: hsf-prod, labels: {app: uplink-svc}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: uplink-svc}}
+  template:
+    metadata: {labels: {app: uplink-svc}}
+    spec:
+      priorityClassName: hsf-normal
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: uplink-svc}}}
+      containers:
+      - name: app
+        image: 10.167.2.175:30500/hsf/uplink:3.0.1
+        ports: [{containerPort: 8099}]
+        envFrom: [{secretRef: {name: hsf-secrets}}]   # JWT_SECRET/DB_*
+        resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {cpu: 500m, memory: 512Mi}}
+        readinessProbe: {httpGet: {path: /readyz, port: 8099}, periodSeconds: 5, failureThreshold: 3}
+        livenessProbe: {httpGet: {path: /healthz, port: 8099}, initialDelaySeconds: 20, periodSeconds: 10}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: uplink-svc, namespace: hsf-prod, labels: {app: uplink-svc, metrics: "true"}}
+spec:
+  type: ClusterIP
+  selector: {app: uplink-svc}
+  ports: [{name: http-metrics, port: 8099, targetPort: 8099}]

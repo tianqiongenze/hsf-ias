@@ -1,0 +1,2 @@
+# uplink 服务：无三期增量依赖（base 镜像 szxc/base:1.2 已含 fastapi/uvicorn/PyJWT/prometheus-client/
+# pymysql——docs/08 §3 冻结：纯 TiDB 读写 + transport 隔离层，V-3 红线）。本文件保留为空以对齐全家族结构。

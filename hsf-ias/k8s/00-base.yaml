@@ -42,7 +42,7 @@ spec:
   hard:
     requests.cpu: "12"        # CONVENTIONS §2.15 冻结值；基础负载仅占 ~19%（06 号 §8.2），余量给 HPA/压测 Job
     requests.memory: 24Gi
-    limits.cpu: "32"          # 满载(gw6+iam4+其余)约 26C，留 k6/Locust/E2E Job 余量
+    limits.cpu: "36"          # W-2（docs/08 §6，CONVENTIONS-P3）：32→36——三期 rs(1C)+uplink(0.5C) limits 增量；当前 used≈26.5C，36 上限仍留 ≥9C 给其他租户
     limits.memory: 48Gi       # CONVENTIONS §2.15 冻结值
     persistentvolumeclaims: "10"
     pods: "60"
@@ -74,7 +74,7 @@ spec:
   hard:
     requests.cpu: "12"        # dev 与 prod 同配额池（02 号 §5.1：同构、副本减半）
     requests.memory: 24Gi
-    limits.cpu: "32"
+    limits.cpu: "36"
     limits.memory: 48Gi
     pods: "60"
 ---

@@ -1,10 +1,13 @@
 #!/bin/bash
 # HSF 镜像构建（在 175 服务器 /opt/hsf/hsf-ias 下执行，构建上下文=仓库根）
 # 一期 8 镜像：hsf/base + hsf/gw + hsf/{iam,land,project,facility,sim,web}，tag 1.0（CONVENTIONS §1/§3.3）
-# 二期（CONVENTIONS-P2 T-2）：统一 tag 2.0——sim/iot/ratelimit/gw/web 全部重建；iam/land/project/facility 沿用 1.0.1 不重建
+# 二期（CONVENTIONS-P2 T-2）：tag 2.0——sim/iot/ratelimit/gw/web 重建
+# 三期（CONVENTIONS-P3 U-2）：tag 3.0——gw/sim/iot/web 重建 + rs/uplink 新增；ratelimit 2.0、四子图 1.0.1 不动
 set -e
 REG=10.167.2.175:30500
-TAG=${TAG:-2.0}
+TAG=${TAG:-3.0}
+P3=0
+[ "${TAG}" = "3.0" ] && P3=1
 P2=0
 [ "${TAG}" = "2.0" ] && P2=1
 cd "$(dirname "$0")/.."
@@ -23,8 +26,15 @@ echo "── 构建网关 gw"
 docker build -f gw/Dockerfile -t $REG/hsf/gw:$TAG .
 docker push $REG/hsf/gw:$TAG
 
-if [ "$P2" = "1" ]; then
-  # 二期服务集：sim(2.0 改造) + iot/ratelimit(新增) + web(2.0 增量)；iam/land/project/facility 沿用 1.0.1
+if [ "$P3" = "1" ]; then
+  # 三期服务集：gw + sim/iot/web(3.0 重建) + rs/uplink(3.0 新增)
+  for s in sim iot web rs uplink; do
+    echo "── 构建 $s"
+    docker build -f services/$s/Dockerfile --build-arg BASE=$BASE -t $REG/hsf/$s:$TAG .
+    docker push $REG/hsf/$s:$TAG
+  done
+  echo "✅ 三期镜像构建并推送完成 tag=$TAG（hsf/gw + hsf/{sim,iot,web,rs,uplink}）"
+elif [ "$P2" = "1" ]; then
   for s in sim iot ratelimit web; do
     echo "── 构建 $s"
     docker build -f services/$s/Dockerfile --build-arg BASE=$BASE -t $REG/hsf/$s:$TAG .

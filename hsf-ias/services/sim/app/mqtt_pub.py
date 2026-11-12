@@ -71,6 +71,10 @@ class MqttPublisher:
                              protocol=mqtt.MQTTv311, clean_session=True)
         client.username_pw_set(self._user, self._password)
         client.reconnect_delay_set(1, 30)
+        # W-1（docs/08 §5，CONVENTIONS-P3）：inflight 100→1000——二期 iot-write 实测 2.4 万条/迭代
+        # p95=8.29s 的主因即 inflight 窗口 × PUBACK RTT 的同步发布阻塞；broker 侧 max_inflight_messages
+        # 已同步调 1000（k8s/30-mqtt.yaml），QoS1 语义与幂等键不变
+        client.max_inflight_messages_set(1000)
         client.on_connect = self._on_connect
         client.on_disconnect = self._on_disconnect
         client.connect_async(self._host, self._port, keepalive=KEEPALIVE)

@@ -2,7 +2,7 @@
 """HSF 无头浏览器全链路功能测试（Playwright，一期 13 条 + 二期 6 条 = 19 条，docs/07 §6.1 冻结）。
 一期：三端渲染 / 登录 / 错密拒绝 / 一张图地块渲染 / 项目创建+7 态全周期流转 /
       设施台账+报修工单 4 态闭环 / 告警查询 / 联邦跨域 / 限流触发（限流放最后）。
-二期（docs/07 §4/§6）：TimescaleDB 就绪探针 / 设备列表 48 台（page 同源 fetch /iot/）/
+二期（docs/07 §4/§6）：TimescaleDB 就绪探针 / 设备列表 ≥48 台（page 同源 fetch /iot/）/
       MQTT 链路端到端（tick 后 5s 内 latest 可查）/ 灌溉建议生成+6h 去重 / 通知列表与已读 /
       同源反代 page fetch /graphql 200（一期遗留专项，T-1）。
 以 JSON 行输出每步结论，结尾 FAIL 计数；约定与 hsf/docs/05、docs/07 冻结契约逐条对应。
@@ -85,11 +85,13 @@ def iot_get(page, path, token=None, timeout=20000):
         return {"raw": resp.text()}, resp.status
 
 
-def iot_post(page, path, token=None, timeout=20000):
+def iot_post(page, path, token=None, body=None, timeout=20000):
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = "Bearer " + token
-    resp = page.request.post(IOT + path, headers=headers, timeout=timeout)
+    resp = page.request.post(IOT + path, headers=headers,
+                             data=json.dumps(body) if body is not None else None,
+                             timeout=timeout)
     try:
         return json.loads(resp.text()), resp.status
     except Exception:
@@ -306,7 +308,9 @@ def main():
         except Exception as e:
             rec("TimescaleDB就绪探针", False, str(e)[:80])
 
-        # 15 设备列表 48 台（page 同源 fetch '/iot/devices'——经 web nginx /iot/ 反代，V2-14）
+        # 15 设备列表（page 同源 fetch '/iot/devices'——经 web nginx /iot/ 反代，V2-14）
+        # 二期基线 48 台（sim 生成）；三期新增 /devices/register 注册设备（如 S5306001099，
+        # docs/08 §4 用例 24）后 total 变为 49——断言放宽为 ≥48 且必含 soil_moisture，不再锁死 48
         # 跨节点 IPIP 间歇丢包（docs/14 坑#11 环境遗留）偶发 page fetch 网络失败：同源 fetch 带 3 次重试
         try:
             page.goto(WEB, timeout=25000)
@@ -324,7 +328,7 @@ def main():
                 if dv["s"] == 200:
                     break
                 time.sleep(2)
-            rec("设备列表48台", dv["s"] == 200 and dv["total"] == 48 and dv["soil"],
+            rec("设备列表≥48台", dv["s"] == 200 and dv["total"] >= 48 and dv["soil"],
                 "http=%s total=%s items=%s 含soil_moisture=%s" % (dv["s"], dv["total"], dv["n"], dv["soil"]))
         except Exception as e:
             rec("设备列表48台", False, str(e)[:80])
@@ -431,6 +435,126 @@ def main():
                 "http=%s typename=%s" % (pg19["s"], pg19["t"]))
         except Exception as e:
             rec("同源反代GraphQL", False, str(e)[:80])
+
+        # ── 三期用例 20~25（docs/08 §7/X-1：遥感 NDVI 链路 / 上报闭环 / 设备注册 / 新反代）──
+        RS = os.environ.get("RS", "http://rs-svc.hsf-prod.svc.cluster.local:8098")
+        UPLINK = os.environ.get("UPLINK", "http://uplink-svc.hsf-prod.svc.cluster.local:8099")
+
+        def rs_req(method, path, token=None, body=None, timeout=60000):
+            headers = {"Content-Type": "application/json"}
+            if token:
+                headers["Authorization"] = "Bearer " + token
+            resp = page.request.fetch(RS + path, method=method,
+                                      data=json.dumps(body) if body is not None else None,
+                                      headers=headers, timeout=timeout)
+            try:
+                return json.loads(resp.text()), resp.status
+            except Exception:
+                return {}, resp.status
+
+        def ul_req(method, path, token=None, body=None, timeout=30000):
+            headers = {"Content-Type": "application/json"}
+            if token:
+                headers["Authorization"] = "Bearer " + token
+            resp = page.request.fetch(UPLINK + path, method=method,
+                                      data=json.dumps(body) if body is not None else None,
+                                      headers=headers, timeout=timeout)
+            try:
+                return json.loads(resp.text()), resp.status
+            except Exception:
+                return {}, resp.status
+
+        # 20 遥感样本登记→解译→长势查询（docs/08 §2 全链路：seed 幂等、两级 NDVI 分级覆盖）
+        try:
+            sd, sd_code = rs_req("POST", "/sample/seed", atok)
+            vg, vg_code = rs_req("GET", "/vigor?page=1&size=50", atok)
+            levels = {x.get("vigorLevel") for x in (vg.get("items") or [])}
+            ok20 = (sd_code == 200 and vg_code == 200
+                    and int(vg.get("total") or 0) >= 4
+                    and levels & {"旺长", "正常", "偏弱", "长势差"})
+            rec("遥感NDVI解译长势", ok20,
+                "seed_http=%s vigor_total=%s levels=%s"
+                % (sd_code, vg.get("total"), sorted(levels)))
+        except Exception as e:
+            rec("遥感NDVI解译长势", False, str(e)[:80])
+
+        # 21 非农化预警（第二景对 L5306000003 构造降幅 0.30>0.15 且后景 0.25<0.30 → RULE_NDVIFALL）
+        try:
+            al, al_code = rs_req("GET", "/alerts?page=1&size=5", atok)
+            ok21 = (al_code == 200 and int(al.get("total") or 0) >= 1
+                    and (al.get("items") or [{}])[0].get("rule_code") == "RULE_NDVIFALL")
+            rec("非农化预警生成", ok21,
+                "total=%s rule=%s" % (al.get("total"),
+                                      (al.get("items") or [{}])[0].get("rule_code")))
+        except Exception as e:
+            rec("非农化预警生成", False, str(e)[:80])
+
+        # 22 上报任务创建→发送→回执闭环（docs/08 §3.2 状态机 PENDING→ACKED，stub 校验回执）
+        try:
+            batch = "B" + dt.datetime.now().strftime("%Y%m%d%H%M%S")
+            t1, t1_code = ul_req("POST", "/tasks", atok,
+                                 {"batchCode": batch, "countyCode": "530600"})
+            t1b, _ = ul_req("POST", "/tasks", atok,
+                            {"batchCode": batch, "countyCode": "530600"})
+            t2, t2_code = ul_req("POST", "/tasks/%s/send" % batch, atok)
+            ok22 = (t1_code == 200 and t2_code == 200 and not t1b.get("dedup") is None
+                    and t2.get("state") == "ACKED"
+                    and (t2.get("receipt") or {}).get("accepted") is True)
+            rec("上报任务回执闭环", ok22,
+                "create=%s items=%s 幂等=%s state=%s receipt=%s"
+                % (t1_code, t1.get("itemCount"), t1b.get("dedup"), t2.get("state"),
+                   (t2.get("receipt") or {}).get("checksum")))
+        except Exception as e:
+            rec("上报任务回执闭环", False, str(e)[:80])
+
+        # 23 上报 payload 导出（docs/05 §8.1"导出通道"：四类 items 齐全 + WKT 提示）
+        try:
+            pl, pl_code = ul_req("GET", "/tasks/%s/payload" % batch, atok)
+            types = {x.get("type") for x in (pl.get("items") or [])}
+            wkt = any(x.get("geoWktHint") for x in (pl.get("items") or [])
+                      if x.get("type") == "PARCEL")
+            ok23 = (pl_code == 200 and pl.get("countyCode") == "530600"
+                    and types == {"PARCEL", "PROJECT", "FACILITY", "SENSOR"} and wkt)
+            rec("上报payload导出", ok23,
+                "http=%s county=%s types=%s wkt=%s" % (pl_code, pl.get("countyCode"),
+                                                       sorted(types), wkt))
+        except Exception as e:
+            rec("上报payload导出", False, str(e)[:80])
+
+        # 24 设备接入注册（docs/08 §4：SM3 凭证一次性下发 + hint 落库；幂等冲突 409）
+        try:
+            dev = "S5306001099"
+            r1, r1_code = iot_post(page, "/devices/register", atok,
+                                   {"deviceCode": dev, "metric": "soil_moisture",
+                                    "villageCode": "53060010101",
+                                    "parcelCode": "L5306000001"})
+            r2, r2_code = iot_post(page, "/devices/register", atok,
+                                   {"deviceCode": dev, "metric": "soil_moisture",
+                                    "villageCode": "53060010101"})
+            ok24 = (r1_code == 200 and len(r1.get("mqttPassword") or "") == 16
+                    and r1.get("mqttUsername") == dev and r2_code == 409)
+            rec("设备注册凭证下发", ok24,
+                "http=%s pwd_len=%s user=%s 幂等409=%s"
+                % (r1_code, len(r1.get("mqttPassword") or ""), r1.get("mqttUsername"),
+                   r2_code == 409))
+        except Exception as e:
+            rec("设备注册凭证下发", False, str(e)[:80])
+
+        # 25 同源反代 /rs/（三期 nginx location /rs/ → rs-svc:8098）
+        try:
+            page.goto(WEB, timeout=25000)
+            page.wait_for_load_state("domcontentloaded", timeout=20000)
+            pg25 = page.evaluate(
+                """async () => {
+                    const t = localStorage.getItem('hsf_token') || '';
+                    const r = await fetch('/rs/vigor?page=1&size=1',
+                        { headers: { Authorization: 'Bearer ' + t } });
+                    return { s: r.status };
+                }""")
+            rec("同源反代遥感", pg25["s"] == 200, "http=%s" % pg25["s"])
+        except Exception as e:
+            rec("同源反代遥感", False, str(e)[:80])
+
 
         # ── 9. 限流触发（登录态 1500 并发突发 → ≥1 个 HTTP 429 + RATE_LIMITED；放最后避免影响前序用例）──
         # 二期改造（docs/07 §6.1 用例 8 / §9-③）：固定窗口 1200/min/key；突发前对齐分钟窗口起点，

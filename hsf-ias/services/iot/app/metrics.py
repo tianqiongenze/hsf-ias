@@ -10,3 +10,4 @@ ONCONFLICT_SKIPPED = Counter("hsf_iot_onconflict_skipped_total",
 FLUSH_SECONDS = Histogram("hsf_iot_flush_seconds", "批量刷写耗时（s）")
 RULE_TRIPPED = Counter("hsf_iot_rule_tripped_total", "回差状态机新触发告警数", ["rule_code"])
 ADVICE_CREATED = Counter("hsf_iot_advice_created_total", "灌溉建议生成数")
+DEVICE_REGISTERED = Counter("hsf_iot_device_registered_total", "设备接入注册数（三期 D-08-4）")

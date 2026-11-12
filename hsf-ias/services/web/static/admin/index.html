@@ -59,6 +59,8 @@ input,select,textarea{padding:10px;border:1px solid var(--line);border-radius:9p
       <div onclick="pg('wo',this)">🔧 工单处置</div>
       <div onclick="pg('alert',this)">📣 告警列表</div>
       <div onclick="pg('iot',this)">📡 设备与墒情</div>
+        <div onclick="pg('rs',this)">🛰️ 遥感长势</div>
+        <div onclick="pg('uplink',this)">📤 上级上报</div>
     </div>
     <div class="main">
       <section id="p-dash">
@@ -146,6 +148,33 @@ input,select,textarea{padding:10px;border:1px solid var(--line);border-radius:9p
         <table><thead><tr><th>编号</th><th>传感器</th><th>规则</th><th>指标</th><th>触发值</th><th>触发时间</th><th>村</th><th>状态</th></tr></thead><tbody id="iaBody"></tbody></table>
         </div>
       </section>
+      <section id="p-rs" style="display:none">
+        <div class="panel"><h3>🛰️ 遥感长势（NDVI CPU 解译，docs/08 §2）
+          <button class="act" style="float:right" onclick="loadRs()">刷新</button>
+          <button class="act" style="float:right;margin-right:8px" onclick="seedRs()">生成样本影像并解译</button></h3>
+          <div id="rsSummary" class="note">说明：合成样本栅格（V-2）与真实 GeoTIFF 链路同构；第二景对 L5306000003 构造降幅触发非农化预警。</div>
+          <table><thead><tr><th>影像景</th><th>地块</th><th>NDVI 均值</th><th>最小/最大</th><th>长势分级</th><th>像元数</th></tr></thead>
+          <tbody id="rsBody"><tr><td colspan="6">加载中…</td></tr></tbody></table>
+        </div>
+        <div class="panel"><h3>⚠️ 非农化预警（RULE_NDVIFALL，docs/08 §2.3）</h3>
+          <table><thead><tr><th>编号</th><th>地块</th><th>NDVI 值</th><th>触发时间</th><th>状态</th></tr></thead>
+          <tbody id="rsAlertBody"><tr><td colspan="5">加载中…</td></tr></tbody></table>
+        </div>
+      </section>
+      <section id="p-uplink" style="display:none">
+        <div class="panel"><h3>📤 上级平台上报（全国农田建设综合监测监管平台，docs/08 §3）
+          <button class="act" style="float:right" onclick="loadUplink()">刷新</button></h3>
+          <div class="note">批次编码幂等；transport 为 stub 回执（V-3），真实平台联调仅替换 transport.py。</div>
+          <div style="margin:8px 0">
+            <input id="fBatch" placeholder="批次编码，如 B20261108001" style="width:220px">
+            <input id="fCounty" value="530600" style="width:100px">
+            <button class="act" onclick="createUplink()">创建上报任务</button>
+            <button class="act" onclick="sendUplink()">发送最新批次</button>
+          </div>
+          <table><thead><tr><th>批次</th><th>条目数</th><th>状态</th><th>回执</th><th>发送时间</th></tr></thead>
+          <tbody id="upBody"><tr><td colspan="5">加载中…</td></tr></tbody></table>
+        </div>
+      </section>
     </div>
   </div>
 </div>
@@ -179,8 +208,8 @@ async function doLogin(){
 
 function pg(p,el){
   document.querySelectorAll('.nav div').forEach(x=>x.classList.remove('on'));el.classList.add('on');
-  ['dash','proj','fac','wo','alert','iot'].forEach(s=>document.getElementById('p-'+s).style.display=s===p?'block':'none');
-  ({dash:loadDash,proj:()=>{loadProjects();ensureProjForm();},fac:loadFacilities,wo:loadWorkorders,alert:loadAlerts,iot:loadIot})[p]();
+  ['dash','proj','fac','wo','alert','iot','rs','uplink'].forEach(s=>document.getElementById('p-'+s).style.display=s===p?'block':'none');
+  ({dash:loadDash,proj:()=>{loadProjects();ensureProjForm();},fac:loadFacilities,wo:loadWorkorders,alert:loadAlerts,iot:loadIot,rs:loadRs,uplink:loadUplink})[p]();
 }
 
 async function boot(){
@@ -394,6 +423,63 @@ async function loadIotAlerts(){
       <td>${(a.trigTime||'').slice(5,16).replace('T',' ')}</td><td>${vName(a.villageCode)}</td>
       <td><span class="tag ${a.state==='OPEN'?'r':a.state==='PROCESSING'?'w':'g'}">${ALERT_STATE[a.state]||a.state}</span></td></tr>`).join('')||'<tr><td colspan="8">暂无告警</td></tr>';
   }catch(e){iaBody.innerHTML=`<tr><td colspan="8">${esc(e.message)}</td></tr>`}
+}
+
+// ── 三期：遥感长势（/rs/ 同源代理，docs/08 §2.4）与上级上报（/uplink/，§3.2）──
+const VIGOR_COLOR={'旺长':'#2e7d32','正常':'#558b2f','偏弱':'#f9a825','长势差':'#c62828'};
+let lastBatch='';
+async function loadRs(){
+  try{
+    const d=await (await fetch('/rs/vigor?page=1&size=50',{headers:hdr()})).json();
+    document.getElementById('rsBody').innerHTML=(d.items||[]).map(v=>`<tr>
+      <td>${v.sceneCode}</td><td>${v.parcelCode}</td>
+      <td><b style="color:${VIGOR_COLOR[v.vigorLevel]||'#333'}">${v.ndviMean}</b></td>
+      <td>${v.ndviMin} / ${v.ndviMax}</td>
+      <td><span class="tag" style="background:${VIGOR_COLOR[v.vigorLevel]||'#888'}">${v.vigorLevel}</span></td>
+      <td>${v.pixelCount}</td></tr>`).join('')||'<tr><td colspan="6">暂无解译结果——点击"生成样本影像并解译"</td></tr>';
+    const a=await (await fetch('/rs/alerts?page=1&size=10',{headers:hdr()})).json();
+    document.getElementById('rsAlertBody').innerHTML=(a.items||[]).map(x=>`<tr>
+      <td>${x.id}</td><td>${x.parcelCode||'—'}</td><td>${x.value}</td>
+      <td>${(x.trigTime||'').slice(0,16)}</td>
+      <td><span class="tag ${x.state==='OPEN'?'r':'g'}">${ALERT_STATE[x.state]||x.state}</span></td></tr>`).join('')
+      ||'<tr><td colspan="5">无非农化预警</td></tr>';
+  }catch(e){document.getElementById('rsBody').innerHTML=`<tr><td colspan="6">${esc(e.message)}</td></tr>`}
+}
+async function seedRs(){
+  try{
+    const r=await (await fetch('/rs/sample/seed',{method:'POST',headers:hdr()})).json();
+    lastBatch='';
+    document.getElementById('rsSummary').textContent='样本解译完成：'+JSON.stringify(r.scenes&&r.scenes.map(s=>({scene:s.sceneCode,地块:s.parcels,预警:s.alerts})));
+    loadRs();
+  }catch(e){document.getElementById('rsSummary').textContent='失败：'+e.message}
+}
+async function loadUplink(){
+  try{
+    const d=await (await fetch('/uplink/tasks?page=1&size=20',{headers:hdr()})).json();
+    document.getElementById('upBody').innerHTML=(d.items||[]).map(t=>`<tr>
+      <td>${t.batchCode}</td><td>${t.itemCount}</td>
+      <td><span class="tag ${t.state==='ACKED'?'g':t.state==='REJECTED'?'r':'w'}">${t.state}</span></td>
+      <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis">${JSON.stringify(t.receipt)||'—'}</td>
+      <td>${(t.sentAt||'').slice(0,19)||'—'}</td></tr>`).join('')||'<tr><td colspan="5">暂无上报任务</td></tr>';
+    if(d.items&&d.items[0]) lastBatch=d.items[0].batchCode;
+  }catch(e){document.getElementById('upBody').innerHTML=`<tr><td colspan="5">${esc(e.message)}</td></tr>`}
+}
+async function createUplink(){
+  const b=document.getElementById('fBatch').value.trim()||('B'+Date.now());
+  try{
+    const r=await (await fetch('/uplink/tasks',{method:'POST',headers:hdr(),
+      body:JSON.stringify({batchCode:b,countyCode:document.getElementById('fCounty').value||'530600'})})).json();
+    alert('任务已创建：'+b+' 条目 '+r.itemCount+(r.dedup?'（幂等命中已有任务）':''));
+    loadUplink();
+  }catch(e){alert('创建失败：'+e.message)}
+}
+async function sendUplink(){
+  if(!lastBatch){alert('暂无批次——请先创建');return}
+  try{
+    const r=await (await fetch('/uplink/tasks/'+lastBatch+'/send',{method:'POST',headers:hdr()})).json();
+    alert('发送结果：'+r.state+'\n回执：'+JSON.stringify(r.receipt));
+    loadUplink();
+  }catch(e){alert('发送失败：'+e.message)}
 }
 </script>
 </body>

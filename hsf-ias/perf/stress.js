@@ -139,8 +139,8 @@ export function teardown(data) {
 ═══ iot-write 时序吞吐报告（docs/07 §6.3：单独记录，不进 thresholds）═══
   执行时长            ：${el.toFixed(1)} s
   TimescaleDB 落库    ：${dw} 条（iot /metrics hsf_iot_readings_written_total 差值：${base.written} → ${end.written}）
-  全链路吞吐          ：${(dw / el).toFixed(1)} 条/s（sim 生成→MQTT→iot 缓冲→TimescaleDB）
-  发布条数            ：见 Counter iot_published（sim:2.0 tick 响应 published；单迭代 500×48=2.4 万条）
+  全链路吞吐          ：${(dw / el).toFixed(1)} 条/s（sim 生成→MQTT→iot 缓冲→TimescaleDB；口径=TimescaleDB 落库行数差值÷秒，非 k6 iter/s）
+  发布条数            ：见 Counter iot_published（sim:2.0 tick 响应 published；单迭代 500×48=2.4 万条。单位为"条"——iot_published 是业务数据条数计数器，与 k6 内置 http_reqs（单位=请求）不同源，读数时勿混淆）
   参考目标            ：≥5000 条/s（观测记录，无硬阈值；判读另见 hsf_iot_flush_seconds p95 与 onconflict_skipped≈0）
 `);
 }

@@ -1,0 +1,4 @@
+# rs 服务新增依赖（CONVENTIONS-P3 U-1/V-1）：基础镜像 szxc/base:1.2 已内置
+# requirements-base.txt 全部锁定依赖（fastapi/uvicorn/prometheus-client/PyJWT 等）；
+# 本文件仅列三期增量，Dockerfile 构建时 pip install。
+numpy==2.1.3

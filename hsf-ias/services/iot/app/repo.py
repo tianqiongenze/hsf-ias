@@ -14,6 +14,7 @@ import time
 
 from hsf_common import db
 from hsf_common.cache import invalidate_prefix
+from hsf_common.crypto import sm3
 
 from . import decision, metrics, rules, tsdb
 
@@ -110,6 +111,18 @@ DDL = [
   KEY idx_role_time (user_role, created_at),
   KEY idx_role_unread (user_role, village_code, read_at)
 ) COMMENT='站内通知（写侧=iot，读侧=mobile 拉取 API；已读=read_at 置位）'""",
+    # 设备接入凭证（三期 docs/08 §4，D-08-4 新增）：仅存 SM3 摘要与提示，明文只下发一次
+    """CREATE TABLE IF NOT EXISTS hsf_biz.device_cred(
+  id           BIGINT      NOT NULL AUTO_INCREMENT,
+  device_code  CHAR(20)    NOT NULL COMMENT '设备编码（=MQTT username，对应 hsf_biz.sensor.sensor_code）',
+  secret_hash  CHAR(64)    NOT NULL COMMENT 'SM3(明文凭证)——明文只在注册响应下发一次',
+  secret_hint  CHAR(8)     NOT NULL COMMENT '明文凭证前 8 位（核对用，非机密）',
+  acl_pattern  VARCHAR(64) NOT NULL DEFAULT 'hsf/sensor/{device}/#' COMMENT 'mosquitto pattern 授权 topic',
+  state        VARCHAR(16) NOT NULL DEFAULT 'ACTIVE' COMMENT 'ACTIVE/REVOKED',
+  created_at   DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_cred_device (device_code)
+) COMMENT='设备 MQTT 接入凭证（D-08-4；passwd 追加走 scripts/dep-device.sh）'""",
 ]
 
 
@@ -508,6 +521,40 @@ def scope_where(role: str | None, user_id: int, col: str = "village_code") -> tu
 def _page(page: int, size: int) -> tuple[int, int]:
     """分页规约（05 §2.2）：page≥1，顶层 size≤100。"""
     return max(page, 1), min(max(size, 1), 100)
+
+
+def register_device(device_code: str, metric: str, village_code: str,
+                    parcel_code: str | None) -> dict | None:
+    """设备接入注册（三期 docs/08 §4，D-08-4）：台账登记 + SM3 凭证生成与一次性下发。
+
+    幂等：sensor_code 或 device_cred.device_code 已存在 → 返回 None（凭证不重复下发）。
+    明文凭证仅在响应中出现一次；库内只存 SM3 摘要（secret_hash）与前 8 位提示（secret_hint）。
+    broker 侧 passwd 追加走 scripts/dep-device.sh（运行时自动同步为三期后补项）。"""
+    exists = db.query("SELECT sensor_code FROM hsf_biz.sensor WHERE sensor_code=%s",
+                      (device_code,), one=True)
+    cred_exists = db.query("SELECT device_code FROM hsf_biz.device_cred WHERE device_code=%s",
+                           (device_code,), one=True)
+    if exists or cred_exists:
+        return None
+    salt = dt.datetime.now().strftime("%Y%m%d%H%M%S%f")
+    secret = sm3(f"{device_code}:{salt}".encode())[:16]
+    db.execute(
+        "INSERT INTO hsf_biz.sensor(sensor_code,metric,village_code,parcel_code,status) "
+        "VALUES(%s,%s,%s,%s,'ACTIVE')",
+        (device_code, metric, village_code, parcel_code))
+    db.execute(
+        "INSERT INTO hsf_biz.device_cred(device_code,secret_hash,secret_hint,acl_pattern) "
+        "VALUES(%s,%s,%s,%s)",
+        (device_code, sm3(secret.encode()), secret[:8], f"hsf/sensor/{device_code}/#"))
+    db.execute("INSERT INTO hsf_biz.domain_event(topic,payload) VALUES(%s,%s)",
+               ("iot.device.registered",
+                json.dumps({"device": device_code, "metric": metric,
+                            "village": village_code}, ensure_ascii=False)))
+    metrics.DEVICE_REGISTERED.inc()
+    return {"deviceCode": device_code, "metric": metric, "villageCode": village_code,
+            "parcelCode": parcel_code, "mqttUsername": device_code,
+            "mqttPassword": secret, "aclPattern": f"hsf/sensor/{device_code}/#",
+            "note": "凭证仅本次下发；broker passwd 追加执行 scripts/dep-device.sh 后生效"}
 
 
 def devices_list(village_code: str | None, metric: str | None, page: int, size: int,
