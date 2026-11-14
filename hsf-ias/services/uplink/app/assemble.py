@@ -15,8 +15,16 @@ def map_type(code: str) -> str:
     return _TYPE_MAP.get(code[:1], "OTHER")
 
 
-def build_payload(county: str) -> dict:
-    """组装完整上报批次（items 按四类分组，summary 计数）。"""
+def build_payload(county: str, batch: str = "") -> dict:
+    """组装完整上报批次（items 仅含四类，summary 计数）。
+
+    batch：批次编码回填 reportBatch（docs/08 §3.1 payload 契约首字段）——stub 校验
+    "缺少 reportBatch" 即 REJECTED，创建任务时必须回填（docs/08 §3.2 状态闭环前提）。
+
+    P3-3 收口（2026-11-14）：payload 契约（D-08-2）items 只允许 PARCEL/PROJECT/FACILITY/
+    SENSOR 四类——历史数据中非统一编码设备（如 DEV-*）映射为 OTHER 后**排除出 items**，
+    以 summary.EXCLUDED 与顶层 excludedOther 如实计数（不静默丢弃）；stub 校验规则不变
+    （防御纵深：即使未来数据绕过排除也回执 REJECTED 而非带病上报）。"""
     items: list[dict] = []
 
     for r in db.query("SELECT code, name, state, build_year, content, applicant_org_code "
@@ -40,17 +48,28 @@ def build_payload(county: str) -> dict:
                       "parcelCode": r["parcel_code"], "state": r["status"],
                       "villageCode": r["village_code"]})
 
-    for r in db.query("SELECT s.sensor_code, s.metric, s.village_code, s.status AS state "
+    excluded = 0
+    for r in db.query("SELECT s.sensor_code, s.metric, s.village_code, s.parcel_code, s.status AS state "
                       "FROM hsf_biz.sensor s ORDER BY s.sensor_code"):
+        if map_type(r["sensor_code"]) == "OTHER":
+            excluded += 1   # P3-3：非统一编码设备不进 items（summary.EXCLUDED 计数留痕）
+            continue
         items.append({"type": map_type(r["sensor_code"]), "code": r["sensor_code"],
                       "metric": r["metric"], "villageCode": r["village_code"],
+                      # parcelCode=设备注册登记的地块关联（hsf_biz.sensor.parcel_code，docs/08 §3.1/§4）：
+                      # 上级平台按地块聚合传感器，与 FACILITY 项同口径；可为空=未挂地块
+                      "parcelCode": r["parcel_code"],
                       "state": r["state"]})
 
     summary: dict[str, int] = {}
     for it in items:
         summary[it["type"]] = summary.get(it["type"], 0) + 1
-    return {"reportBatch": "", "countyCode": county, "items": items,
-            "summary": summary, "schemaVersion": "1.0"}
+    if excluded:
+        summary["EXCLUDED"] = excluded
+    return {"reportBatch": batch, "countyCode": county, "items": items,
+            "summary": summary,
+            "excludedOther": excluded,   # P3-3 留痕：非统一编码条数（docs/08 §3.1 契约外数据）
+            "schemaVersion": "1.1"}   # 1.0→1.1（2026-11-13 评审修订）：SENSOR 增 parcelCode
 
 
 def _wkt_hint(geo_json: str) -> str:

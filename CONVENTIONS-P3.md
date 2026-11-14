@@ -32,13 +32,17 @@
   `max_inflight_messages 1000` 同步调大（二期实测 2.4 万条/迭代 p95=8.29s 的主因是 inflight=100 × PUBACK RTT）；
   响应契约**不变**（仍同步返回 published 条数——遵守 docs/07 §2.5 冻结），预期 tick p95 降一个量级、
   iot-write check 84%→≥98%。
-- **W-2 ResourceQuota**：`00-base.yaml` hsf-prod-quota `limits.cpu 32→36`（集群 45C 中留 ≥9C 给其他租户，
-  评估记录于 docs/08 §6）；limits.memory 48Gi 不变。
+- **W-2 ResourceQuota**：`00-base.yaml` **仅 hsf-prod-quota** `limits.cpu 32→36`（集群 45C 中留 ≥9C 给其他租户，
+  评估记录于 docs/08 §5）；**hsf-dev-quota 维持 32**（CONVENTIONS §2.15 冻结值——dev 副本减半且部署脚本
+  不含 dev apply，三期无 dev 侧扩容评估，勿同步上调，避免 45C 集群 prod 36+dev 36=72C limits 双计）；
+  limits.memory 48Gi 不变。
 
 ## X. 三期验收增量（X-1~X-3）
 
 - **X-1 E2E ≥25 条**：二期 19 条全保留 + 新增 ≥6 条（影像登记→NDVI 解译→长势查询 / 非农化预警 /
-  上报任务生成→payload 校验→stub 回执→状态闭环 / 设备注册→凭证下发 / admin 新页签渲染 / 同源反代 rs）。
+  上报任务生成→payload 校验→stub 回执→状态闭环 / 设备注册→凭证下发——**API 口径：凭证字段+幂等 409，
+  不含 broker 连通**（端到端设备可连=运行时后补项，规格与实机验证冻结于 docs/08 §4/§6 上线前核验）/
+  admin 新页签渲染 / 同源反代 rs）。
 - **X-2 k6 回归**：browse/report 阈值不变（0 失败、p95 判据同二期）；iot-write 复跑验证 W-1 效果（check≥98% 观测）。
 - **X-3 门禁增量**：static_gate 新增 P3 检查项——rs 必含 numpy 无 torch/tf、uplink 必含 transport 隔离层、
   E2E≥25、新服务探针/limits、清单镜像 tag=3.0 一致性。
@@ -47,5 +51,6 @@
 
 1. 同步代码 → 2. 构建推送 3.0 镜像（gw/sim/iot/web/rs/uplink）→ 3. 00-base（quota+Secret 无新增键）apply →
 4. 20-services apply（rs/uplink 新建，gw/sim/iot/web 滚动）→ 5. rollout status 全绿 →
-6. 新链路验收：影像登记→NDVI→长势查询→非农化预警 / 上报任务→回执闭环 / 设备注册→凭证 /
+6. 新链路验收：影像登记→NDVI→长势查询→非农化预警 / 上报任务→回执闭环 / 设备注册→凭证下发
+   （API 口径；端到端设备可连=§4 运行时后补项，完成后补方可验 broker 连通）/
    二期四链路回归（MQTT→时序、灌溉决策、通知、限流 429）→ 7. E2E+k6 → docs/22。

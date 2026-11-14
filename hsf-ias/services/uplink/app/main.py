@@ -15,7 +15,7 @@ from fastapi import Depends, Header, HTTPException
 from hsf_common import db
 from hsf_common.web import create_app
 
-from . import assemble, repo, transport
+from . import assemble, metrics, repo, transport   # metrics 修复（2026-11-14 部署实测 NameError：main 引用 TASKS/SENDS 未导入）
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
 
@@ -64,7 +64,7 @@ def create_task(body: dict, user: dict = Depends(require_login)):
     if existing is not None:                              # 幂等：重复创建返回已有任务
         return {"batchCode": batch_code, "state": existing["state"],
                 "itemCount": existing["item_count"], "dedup": True}
-    payload = assemble.build_payload(county)
+    payload = assemble.build_payload(county, batch=batch_code)   # reportBatch 回填（§3.1 契约）
     if not payload["items"]:
         raise _http_err(409, "CONFLICT", "无可上报数据（种子库为空）")
     task_id = repo.insert_task(batch_code, payload, len(payload["items"]))

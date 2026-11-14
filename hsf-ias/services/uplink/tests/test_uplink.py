@@ -52,3 +52,34 @@ def test_state_machine_transitions(mock_db):
     receipt, ok = transport.send(task["payload"])
     repo.mark_sent("B1", receipt, ok)
     e.assert_called()                            # 状态迁移写库被调用
+
+
+def test_build_payload_embeds_report_batch(mock_db):
+    """创建任务回填 reportBatch（docs/08 §3.1 契约首字段）——缺失则 stub 校验必 REJECTED
+    （2026-11-13 评审修订前真实缺陷：build_payload 返回空 reportBatch → send 全 REJECTED）。"""
+    q, _ = mock_db
+    row = {"code": "P5306000001", "name": "示范项目", "state": "ARCHIVED",
+           "build_year": "2026", "content": "高标准农田", "applicant_org_code": "53060010101"}
+    q.side_effect = [[row], [], [], []]          # 四类来源查询：项目 1 条 + 其余空
+    p = assemble.build_payload("530600", batch="B20261113001")
+    assert p["reportBatch"] == "B20261113001"
+    assert p["countyCode"] == "530600"
+    assert assemble.validate_payload(p) == []    # stub 校验全通过 → send 必 ACKED
+
+
+def test_build_payload_excludes_other_sensors(mock_db):
+    """P3-3 收口（2026-11-14）：非统一编码设备不进 items，仅 EXCLUDED 计数留痕——
+    历史脏数据（DEV-*）不再致 stub 拒绝整批（D-08-2 四类契约与状态机闭环前提）。"""
+    q, _ = mock_db
+    proj = {"code": "P5306000001", "name": "示范项目", "state": "ARCHIVED",
+            "build_year": "2026", "content": "", "applicant_org_code": None}
+    good = {"sensor_code": "S5306000001", "metric": "soil_moisture",
+            "village_code": "53060010101", "parcel_code": None, "state": "ACTIVE"}
+    dirty = {"sensor_code": "DEV-P3ACC-01", "metric": "soil_moisture",
+             "village_code": "53060010101", "parcel_code": None, "state": "ACTIVE"}
+    q.side_effect = [[proj], [], [], [good, dirty]]   # 项目/地块/设施/传感器
+    p = assemble.build_payload("530600", batch="B1")
+    assert {it["type"] for it in p["items"]} == {"PROJECT", "SENSOR"}   # 无 OTHER
+    assert all(it["code"] != "DEV-P3ACC-01" for it in p["items"])
+    assert p["summary"]["EXCLUDED"] == 1 and p["excludedOther"] == 1    # 如实计数不静默
+    assert assemble.validate_payload(p) == []                           # stub 校验通过 → ACKED

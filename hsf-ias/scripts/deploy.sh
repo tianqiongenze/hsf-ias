@@ -12,7 +12,7 @@ kubectl apply -f k8s/25-timescale.yaml
 kubectl apply -f k8s/30-mqtt.yaml
 kubectl apply -f k8s/20-services.yaml
 if [ -f k8s/60-monitors.yaml ]; then kubectl apply -f k8s/60-monitors.yaml; fi
-for d in gw iam-svc land-svc project-svc facility-svc sim-svc web ratelimit-svc iot-svc; do
+for d in gw iam-svc land-svc project-svc facility-svc sim-svc web ratelimit-svc iot-svc rs-svc uplink-svc; do
   kubectl -n hsf-prod rollout status deploy/$d --timeout=240s
 done
-echo "✅ 全部部署完成（二期验收：{__typename} 200 → 登录 → sim tick → MQTT→TimescaleDB 可查 → /irrigation-advice → /notify → 全局限流 429）"
+echo "✅ 全部部署完成（三期 Y-1 验收：{__typename} 200 → 登录 → 影像登记→NDVI→长势查询→非农化预警 / 上报任务→回执闭环 / 设备注册→凭证下发 / 二期四链路回归：MQTT→时序、灌溉决策、通知、限流 429）"

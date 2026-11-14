@@ -166,6 +166,11 @@ def devices_register(body: dict, user: dict = Depends(require_login)):
     parcel_code = (str(body.get("parcelCode") or "").strip() or None)
     if not device_code or not metric or not village_code:
         raise _http_err(400, "INVALID_ARGUMENT", "缺少 deviceCode/metric/villageCode")
+    # 统一编码校验（docs/04 统一编码 + P3-3 收口）：注册端点仅受理传感器，设备码必须 S 前缀——
+    # 非 S 前缀设备（如早期手工登记 DEV-*）会破坏上报契约（uplink 按 L/P/F/S 映射，docs/08 §3.1）
+    if not device_code.startswith("S"):
+        raise _http_err(400, "INVALID_ARGUMENT",
+                        "deviceCode 必须为统一编码 S 前缀（传感器），收到：" + device_code[:32])
     if metric not in ("soil_moisture", "air_temp", "wind_speed", "rainfall",
                       "pest_index", "water_level"):
         raise _http_err(400, "INVALID_ARGUMENT", "metric 不在 04 §4.7 冻结 6 类之内")

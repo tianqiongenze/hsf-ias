@@ -31,8 +31,11 @@ data:
     user hsf
     topic readwrite hsf/sensor/#
     # 设备接入框架（docs/08 §4，CONVENTIONS-P3）：真实设备以 deviceCode 作为 MQTT username 登录，
-    # pattern 行保证每设备仅能读写自身 topic（%u=username 展开）；凭证经 POST /devices/register
-    # 下发，passwd 追加走 scripts/dep-device.sh（mosquitto_passwd + broker 滚动，运行时自动同步三期后补）
+    # pattern 行保证每设备仅能读写自身 topic（%u=username 展开）；注意 pattern 仅是授权语义——
+    # 生效前提是 password_file 存在对应设备账号：凭证经 POST /devices/register 下发（明文仅响应一次，
+    # 库内只存摘要），passwd 追加=运行时后补项（规格冻结于 docs/08 §4"broker 凭证现状与后补规格"：
+    # scripts/dep-device.sh 用注册响应凭证明文 mosquitto_passwd -b 追加禁用 -c + broker 滚动 +
+    # passwd-init 去 -c 覆盖配套改造；后补前已注册设备无法通过 broker 认证）
     pattern readwrite hsf/sensor/%u/#
 ---
 apiVersion: v1
@@ -57,15 +60,23 @@ spec:
       priorityClassName: hsf-normal
       nodeSelector: {kubernetes.io/hostname: k8s-worker1}   # T-3：master requests 满，只允许 worker1
       initContainers:
-      # 密码文件初始化：mosquitto_passwd -b -c 幂等覆盖重建（docs/07 §2.4）；chown 给运行时 uid 1883
-      # （mosquitto 以 root 启动后自降权到 mosquitto 用户，PVC 目录属 root 则持久化写失败）
+      # 密码文件初始化（docs/08 §4 后补规格②，2026-11-13 评审修订落地）：
+      #   - passwd 文件缺失 → mosquitto_passwd -b -c 按 Secret 初始化单账号 hsf（docs/07 §2.4）；
+      #   - passwd 已存在且含 hsf 账号 → **跳过 -c 重建**——否则 broker pod 每次重启都会
+      #     抹掉 dep-device.sh（规格①）追加的设备条目；账号轮换走 hsf-secrets 更新+手工重建；
+      #   - chown 给运行时 uid 1883（mosquitto 以 root 启动后自降权到 mosquitto 用户，
+      #     PVC 目录属 root 则持久化写失败）
       - name: passwd-init
         image: 10.167.2.175:30500/base/mosquitto:2.1
         command: ["/bin/sh", "-c"]
         args:
         - |
           mkdir -p /mosquitto/data
-          mosquitto_passwd -b -c /mosquitto/data/passwd hsf "$MQTT_PASS"
+          if [ -s /mosquitto/data/passwd ] && grep -q '^hsf:' /mosquitto/data/passwd; then
+            echo "passwd-init: passwd 已存在且含 hsf 账号，跳过 -c 重建（保护 dep-device.sh 追加的设备条目）"
+          else
+            mosquitto_passwd -b -c /mosquitto/data/passwd hsf "$MQTT_PASS"
+          fi
           # acl 同拷入 PVC：见 mosquitto.conf 注释——2.1.2 敏感文件属主校验，ConfigMap
           # 直挂（root 属主）不可读；init 每次启动重拷，ConfigMap 变更重启 pod 即生效
           cp /mosquitto/config/acl /mosquitto/data/acl

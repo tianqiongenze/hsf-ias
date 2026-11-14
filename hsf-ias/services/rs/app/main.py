@@ -16,7 +16,7 @@ from fastapi import Depends, Header, HTTPException
 from hsf_common import db
 from hsf_common.web import create_app
 
-from . import ndvi, repo, sample
+from . import ingest, ndvi, repo, sample
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
 
@@ -61,26 +61,15 @@ app = create_app("rs", startup=_startup)
 def register_scene(body: dict, user: dict = Depends(require_login)):
     require_admin(user)
     try:
-        scene_code = str(body["sceneCode"])
-        acquired_at = str(body["acquiredAt"])
-        bands = body["bands"]
-        red = bands["red"]
-        nir = bands["nir"]
-        assert isinstance(red, list) and isinstance(nir, list) and red and nir, "波段矩阵为空"
-        h = len(red)
-        w = len(red[0])
-        assert len(nir) == h and all(len(r) == w for r in red) and all(
-            len(n) == w for n in nir), "波段矩阵行列不一致"
-        assert 2 <= w * h <= 262144, "栅格规模超界（4~262144 像元）"
-    except KeyError as e:
-        raise _http_err(400, "INVALID_ARGUMENT", f"缺少必填字段：{e}")
-    except AssertionError as e:
+        scene = ingest.json_bands(body)                   # V-2：输入适配器唯一入口
+    except ingest.IngestError as e:
         raise _http_err(400, "INVALID_ARGUMENT", str(e))
-    cell = float(body.get("cellSizeM") or 10.0)
-    source = str(body.get("source") or "SAMPLE")
-    sid = repo.insert_scene(scene_code, source, acquired_at, red, nir, w, h, cell)
-    return {"id": sid, "sceneCode": scene_code, "width": w, "height": h,
-            "state": "REGISTERED", "dedup": sid is None or repo.last_insert_ok() is False}
+    sid = repo.insert_scene(scene["sceneCode"], scene["source"], scene["acquiredAt"],
+                            scene["bands"]["red"], scene["bands"]["nir"],
+                            scene["width"], scene["height"], scene["cellSizeM"])
+    return {"id": sid, "sceneCode": scene["sceneCode"], "width": scene["width"],
+            "height": scene["height"], "state": "REGISTERED",
+            "dedup": sid is None}   # insert_scene 幂等：scene_code 冲突 INSERT IGNORE→None
 
 
 # ── 端点 2：POST /scenes/{code}/process（NDVI 解译，同步 <10s）─────────────────
@@ -98,7 +87,13 @@ def process_scene(scene_code: str, user: dict = Depends(require_login)):
     parcels = repo.parcels_geojson()                      # land 子图同源：hsf_md.land_parcel
     if not parcels:
         raise _http_err(409, "CONFLICT", "无地块掩膜（hsf_md.land_parcel 为空）")
-    result = ndvi.process(scene, parcels)                 # numpy 纯 CPU（V-1）
+    try:
+        result = ndvi.process(scene, parcels)             # numpy 纯 CPU（V-1）
+    except Exception as e:
+        # docs/08 §2.2 ⑤：解译失败 → state=FAILED + domain_event 留痕（outbox 模式，ADR-HSF-004 沿用）
+        repo.mark_scene(scene_code, "FAILED")
+        repo.record_event("rs.process.failed", {"scene": scene_code, "error": str(e)[:200]})
+        raise _http_err(500, "INTERNAL_ERROR", f"解译失败已留痕（state=FAILED）：{e}") from e
     repo.save_vigor(scene_code, result["vigors"])
     repo.mark_scene(scene_code, "PROCESSED")
     alerts = repo.ndvi_fall_alerts(result["vigors"], scene_code, scene["acquired_at"])

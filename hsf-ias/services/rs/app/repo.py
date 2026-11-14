@@ -27,7 +27,7 @@ DDL = [
   scene_code   CHAR(32) NOT NULL,
   parcel_code  CHAR(20) NOT NULL COMMENT '跨库逻辑引用 land_parcel（D-04-3）',
   ndvi_mean    DECIMAL(6,4) NOT NULL, ndvi_min DECIMAL(6,4) NOT NULL, ndvi_max DECIMAL(6,4) NOT NULL,
-  vigor_level  VARCHAR(16) NOT NULL COMMENT '旺长/正常/偏弱/长势差（docs/08 §2.3 冻结阈值）',
+  vigor_level  VARCHAR(16) NOT NULL COMMENT '旺长/正常/偏弱/长势差（docs/08 §2.3 样本期标定阈值）',
   pixel_count  INT NOT NULL,
   created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id), UNIQUE KEY uk_vigor (scene_code, parcel_code),
@@ -75,6 +75,12 @@ def get_scene(scene_code: str) -> dict | None:
 def mark_scene(scene_code: str, state: str) -> None:
     db.execute("UPDATE hsf_biz.rs_scene SET state=%s WHERE scene_code=%s",
                (state, scene_code))
+
+
+def record_event(topic: str, payload: dict) -> None:
+    """domain_event 留痕（outbox 模式，ADR-HSF-004 沿用；§2.2 ⑤ 解译失败/预警同源）。"""
+    db.execute("INSERT INTO hsf_biz.domain_event(topic,payload) VALUES(%s,%s)",
+               (topic, json.dumps(payload, ensure_ascii=False)))
 
 
 def parcels_geojson() -> list[dict]:
@@ -156,7 +162,9 @@ def alerts_list(rule_code: str, page: int, size: int, role: str | None) -> dict:
     where, args = "WHERE a.rule_code=%s", [rule_code]
     total = (db.query(f"SELECT count(*) AS n FROM hsf_biz.alert_record a {where}",
                       tuple(args), one=True) or {}).get("n", 0)
-    items = db.query(f"SELECT a.id, a.rule_code, a.device_code, a.metric, a.value, a.trig_time, "
+    # 列名对齐一期冻结 DDL（iot/app/repo.py：alert_record 列为 sensor_code/trig_value，
+    # 无 device_code/value——2026-11-14 部署实测 1054 修复，D-08-1 存量零变更）
+    items = db.query(f"SELECT a.id, a.rule_code, a.sensor_code, a.metric, a.trig_value, a.trig_time, "
                      f"a.village_code, a.parcel_code, a.state FROM hsf_biz.alert_record a {where} "
                      f"ORDER BY a.id DESC LIMIT %s OFFSET %s",
                      tuple(args) + (size, (page - 1) * size))
@@ -165,22 +173,27 @@ def alerts_list(rule_code: str, page: int, size: int, role: str | None) -> dict:
 
 def ndvi_fall_alerts(vigors: list[dict], scene_code: str, acquired_at: str) -> int:
     """非农化预警：相邻两景降幅判定 → alert_record + notify（复用二期管道，D-08-1 §2.3）。"""
+    # acquired_at 兼容 datetime（get_scene 返回 pymysql DATETIME 对象）与 str（seed 路径）——
+    # 2026-11-14 部署实测 TypeError: 'datetime.datetime' object is not subscriptable 修复
+    acq = (acquired_at.strftime("%Y-%m-%d %H:%M:%S")
+           if hasattr(acquired_at, "strftime") else str(acquired_at))[:19]
     created = 0
     for v in vigors:
-        prev = prev_mean(v["parcel_code"], acquired_at[:19])
+        prev = prev_mean(v["parcel_code"], acq)
         if not ndvi.fall_alerts(prev, v["ndvi_mean"]):
             continue
         scene = db.query("SELECT id FROM hsf_biz.rs_scene WHERE scene_code=%s",
                          (scene_code,), one=True)
         n = db.execute(
-            "INSERT IGNORE INTO hsf_biz.alert_record(rule_code,device_code,metric,value,"
+            # sensor_code=RS-<scene> 合成源标识（非真实传感器；截断 20 对齐冻结 DDL CHAR(20)）
+            "INSERT IGNORE INTO hsf_biz.alert_record(rule_code,sensor_code,metric,trig_value,"
             "trig_time,village_code,parcel_code,state) "
             "SELECT 'RULE_NDVIFALL', %s, 'ndvi', %s, %s, "
             "COALESCE(l.village_code,''), l.code, 'OPEN' FROM hsf_md.land_parcel l "
             "WHERE l.code=%s AND NOT EXISTS(SELECT 1 FROM hsf_biz.alert_record r "
             "WHERE r.rule_code='RULE_NDVIFALL' AND r.parcel_code=%s AND r.trig_time=%s)",
-            (f"RS-{scene_code}", v["ndvi_mean"], acquired_at[:19], v["parcel_code"],
-             v["parcel_code"], acquired_at[:19]))
+            (("RS-" + scene_code)[:20], v["ndvi_mean"], acq, v["parcel_code"],
+             v["parcel_code"], acq))
         created += n
         if n:
             db.execute(

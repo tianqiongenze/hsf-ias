@@ -8,6 +8,7 @@
 维护方、alert_rule 种子唯一来源；TiDB hsf_ts 二期零写入（归档快照）。
 """
 import datetime as dt
+import hashlib
 import json
 import threading
 import time
@@ -116,13 +117,13 @@ DDL = [
   id           BIGINT      NOT NULL AUTO_INCREMENT,
   device_code  CHAR(20)    NOT NULL COMMENT '设备编码（=MQTT username，对应 hsf_biz.sensor.sensor_code）',
   secret_hash  CHAR(64)    NOT NULL COMMENT 'SM3(明文凭证)——明文只在注册响应下发一次',
-  secret_hint  CHAR(8)     NOT NULL COMMENT '明文凭证前 8 位（核对用，非机密）',
+  secret_hint  CHAR(8)     NOT NULL COMMENT 'sha256(明文凭证) 前 8 位（核对用；docs/08 §4 不落明文口径）',
   acl_pattern  VARCHAR(64) NOT NULL DEFAULT 'hsf/sensor/{device}/#' COMMENT 'mosquitto pattern 授权 topic',
   state        VARCHAR(16) NOT NULL DEFAULT 'ACTIVE' COMMENT 'ACTIVE/REVOKED',
   created_at   DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   UNIQUE KEY uk_cred_device (device_code)
-) COMMENT='设备 MQTT 接入凭证（D-08-4；passwd 追加走 scripts/dep-device.sh）'""",
+) COMMENT='设备 MQTT 接入凭证（D-08-4；passwd 追加=运行时后补项，规格 docs/08 §4）'""",
 ]
 
 
@@ -528,8 +529,10 @@ def register_device(device_code: str, metric: str, village_code: str,
     """设备接入注册（三期 docs/08 §4，D-08-4）：台账登记 + SM3 凭证生成与一次性下发。
 
     幂等：sensor_code 或 device_cred.device_code 已存在 → 返回 None（凭证不重复下发）。
-    明文凭证仅在响应中出现一次；库内只存 SM3 摘要（secret_hash）与前 8 位提示（secret_hint）。
-    broker 侧 passwd 追加走 scripts/dep-device.sh（运行时自动同步为三期后补项）。"""
+    明文凭证仅在响应中出现一次；库内只存 SM3 摘要（secret_hash）与 sha256 前 8 位提示
+    （secret_hint，docs/08 §4"不落明文"口径）。
+    broker 侧 passwd 追加=运行时后补项（scripts/dep-device.sh 已按 docs/08 §4 规格①交付，
+    实机执行与规格③连接验证=上线前动作清单 §6——后补前已注册设备无法通过 broker 认证）。"""
     exists = db.query("SELECT sensor_code FROM hsf_biz.sensor WHERE sensor_code=%s",
                       (device_code,), one=True)
     cred_exists = db.query("SELECT device_code FROM hsf_biz.device_cred WHERE device_code=%s",
@@ -542,10 +545,14 @@ def register_device(device_code: str, metric: str, village_code: str,
         "INSERT INTO hsf_biz.sensor(sensor_code,metric,village_code,parcel_code,status) "
         "VALUES(%s,%s,%s,%s,'ACTIVE')",
         (device_code, metric, village_code, parcel_code))
+    # hint 口径（docs/08 §4"不落明文，mqtt_passwd_hint 存 sha256 前 8 位供核对"）：
+    # 存 sha256(明文凭证) 前 8 位十六进制，不存明文片段（2026-11-13 评审修订对齐）
     db.execute(
         "INSERT INTO hsf_biz.device_cred(device_code,secret_hash,secret_hint,acl_pattern) "
         "VALUES(%s,%s,%s,%s)",
-        (device_code, sm3(secret.encode()), secret[:8], f"hsf/sensor/{device_code}/#"))
+        (device_code, sm3(secret.encode()),
+         hashlib.sha256(secret.encode()).hexdigest()[:8],
+         f"hsf/sensor/{device_code}/#"))
     db.execute("INSERT INTO hsf_biz.domain_event(topic,payload) VALUES(%s,%s)",
                ("iot.device.registered",
                 json.dumps({"device": device_code, "metric": metric,
@@ -554,7 +561,7 @@ def register_device(device_code: str, metric: str, village_code: str,
     return {"deviceCode": device_code, "metric": metric, "villageCode": village_code,
             "parcelCode": parcel_code, "mqttUsername": device_code,
             "mqttPassword": secret, "aclPattern": f"hsf/sensor/{device_code}/#",
-            "note": "凭证仅本次下发；broker passwd 追加执行 scripts/dep-device.sh 后生效"}
+            "note": "凭证仅本次下发；broker passwd 追加为运行时后补项（docs/08 §4 规格），完成后方可连 broker"}
 
 
 def devices_list(village_code: str | None, metric: str | None, page: int, size: int,

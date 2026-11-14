@@ -468,7 +468,9 @@ def main():
         try:
             sd, sd_code = rs_req("POST", "/sample/seed", atok)
             vg, vg_code = rs_req("GET", "/vigor?page=1&size=50", atok)
-            levels = {x.get("vigorLevel") for x in (vg.get("items") or [])}
+            # rs REST 返回 snake_case（repo.vigor_list 直传列名：vigor_level/ndvi_mean，P3-1 修复：
+            # 首轮误用 camelCase vigorLevel 致 levels=[None] 必 FAIL——契约以实机 API 为准）
+            levels = {x.get("vigor_level") for x in (vg.get("items") or [])}
             ok20 = (sd_code == 200 and vg_code == 200
                     and int(vg.get("total") or 0) >= 4
                     and levels & {"旺长", "正常", "偏弱", "长势差"})
@@ -522,8 +524,11 @@ def main():
             rec("上报payload导出", False, str(e)[:80])
 
         # 24 设备接入注册（docs/08 §4：SM3 凭证一次性下发 + hint 落库；幂等冲突 409）
+        # P3-2 修复（再可跑性）：register 为 create-only（已存在→409），固定 deviceCode 在
+        # 二次执行 E2E 时首调即 409 必 FAIL（首轮实测 S5306001099 残留）——改为每次运行生成
+        # 一次性统一编码设备（S 前缀保证 uplink SENSOR 映射；%d%H%M%S 秒级唯一，≤CHAR(20)）
         try:
-            dev = "S5306001099"
+            dev = "S5306001" + dt.datetime.now().strftime("%d%H%M%S")
             r1, r1_code = iot_post(page, "/devices/register", atok,
                                    {"deviceCode": dev, "metric": "soil_moisture",
                                     "villageCode": "53060010101",

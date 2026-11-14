@@ -9,9 +9,28 @@ for _p in (os.path.join(_SERVICES, "common"),               # hsf_common
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from unittest import mock                                   # noqa: E402
+from pathlib import Path                                     # noqa: E402
+from unittest import mock                                    # noqa: E402
 
-import pytest                                               # noqa: E402
+import pytest                                                # noqa: E402
+
+_SVC_ROOT = os.path.dirname(_HERE)                           # services/rs（app 包根）
+
+
+def pytest_collectstart(collector):
+    """多服务 tests 同进程收集时 sys.modules['app'] 只有一槽，rs 与 uplink 同名包会串包
+    （后注册 conftest 的服务根占据 sys.path[0]，先收集服务的 from app import … 解析错包）。
+    仅当收集器位于本服务 tests 目录内时：把 rs 根钉回 sys.path[0] 并清掉缓存的 app 包，
+    保证本服务测试模块导入的是 services/rs/app。pytest_collectstart 在模块导入前触发
+    （_pytest/runner.py collect_one_node），钩子内清缓存对本次导入生效。"""
+    path = getattr(collector, "path", None) or getattr(collector, "fspath", None)
+    if path is None or not Path(str(path)).is_relative_to(_HERE):
+        return
+    while _SVC_ROOT in sys.path:
+        sys.path.remove(_SVC_ROOT)
+    sys.path.insert(0, _SVC_ROOT)
+    for name in [n for n in sys.modules if n == "app" or n.startswith("app.")]:
+        del sys.modules[name]
 
 
 @pytest.fixture

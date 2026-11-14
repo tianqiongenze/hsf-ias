@@ -18,6 +18,8 @@ const SUBGRAPHS = (process.env.SUBGRAPHS || [
   'land=http://land-svc.hsf-prod.svc.cluster.local:8092/graphql',
   'project=http://project-svc.hsf-prod.svc.cluster.local:8093/graphql',
   'facility=http://facility-svc.hsf-prod.svc.cluster.local:8094/graphql',
+  // 三期 rs 子图（docs/08 §2.4/§6：rsVigor/rsVigorLatest 顶层查询经 gw 组合）
+  'rs=http://rs-svc.hsf-prod.svc.cluster.local:8098/graphql',
 ].join(',')).split(',').map(s => { const [name, url] = s.split('='); return { name, url }; });
 
 const JWT_SECRET = process.env.JWT_SECRET || 'HsfJwt-2026-bN8wQ4vXzA6sD1fG';

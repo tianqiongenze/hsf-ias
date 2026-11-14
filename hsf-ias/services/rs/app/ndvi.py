@@ -5,12 +5,13 @@ docs/08 §2.2 冻结管道：波段矩阵 → NDVI=(NIR−Red)/(NIR+Red+1e-6) �
 """
 import numpy as np
 
-# docs/08 §2.3 冻结阈值（ndvi_mean 区间，左闭右开，最低档无下界）
+# docs/08 §2.3 样本期标定阈值（ndvi_mean 区间，左闭右开，最低档无下界）——非业务冻结契约，
+# 真实影像需按 docs/08 §2.3 复评机制重标定（VIGOR_LEVELS/FALL_DROP/FALL_CEIL 为唯一实现点）
 VIGOR_LEVELS = (("旺长", 0.60, float("inf")),
                 ("正常", 0.40, 0.60),
                 ("偏弱", 0.20, 0.40),
                 ("长势差", float("-inf"), 0.20))
-# 非农化预警冻结参数（docs/08 §2.3）：相邻两景均值降幅 >0.15 且后景 <0.30
+# 非农化预警标定参数（docs/08 §2.3）：相邻两景均值降幅 >0.15 且后景 <0.30
 FALL_DROP = 0.15
 FALL_CEIL = 0.30
 
@@ -23,7 +24,7 @@ def ndvi_matrix(red: list[list[float]], nir: list[list[float]]) -> np.ndarray:
 
 
 def vigor_level(mean: float) -> str:
-    """NDVI 均值 → 四级长势（§2.3 冻结阈值，先命中先返回）。"""
+    """NDVI 均值 → 四级长势（§2.3 样本期标定阈值，先命中先返回）。"""
     for level, lo, hi in VIGOR_LEVELS:
         if lo <= mean < hi:
             return level

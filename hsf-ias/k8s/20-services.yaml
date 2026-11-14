@@ -27,7 +27,7 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: gw}}}
       containers:
       - name: gw
-        image: 10.167.2.175:30500/hsf/gw:3.0
+        image: 10.167.2.175:30500/hsf/gw:3.0.2
         ports: [{containerPort: 8090}, {containerPort: 9090}]
         env:
         - {name: JWT_SECRET, valueFrom: {secretKeyRef: {name: hsf-secrets, key: JWT_SECRET}}}
@@ -318,7 +318,7 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: iot-svc}}}
       containers:
       - name: app
-        image: 10.167.2.175:30500/hsf/iot:3.0
+        image: 10.167.2.175:30500/hsf/iot:3.0.5
         ports: [{containerPort: 8097}]
         envFrom: [{secretRef: {name: hsf-secrets}}]   # DB_*/REDIS_*/MQTT_PASS/TIMESCALE_PASS 全量注入（§1.4）
         env:
@@ -359,7 +359,7 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: rs-svc}}}
       containers:
       - name: app
-        image: 10.167.2.175:30500/hsf/rs:3.0.1
+        image: 10.167.2.175:30500/hsf/rs:3.0.4
         ports: [{containerPort: 8098}]
         envFrom: [{secretRef: {name: hsf-secrets}}]   # JWT_SECRET/DB_*（seed 与解译写 TiDB）
         resources: {requests: {cpu: 150m, memory: 384Mi}, limits: {cpu: "1", memory: 1Gi}}   # numpy 峰值内存放宽
@@ -393,7 +393,7 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: uplink-svc}}}
       containers:
       - name: app
-        image: 10.167.2.175:30500/hsf/uplink:3.0.1
+        image: 10.167.2.175:30500/hsf/uplink:3.0.5
         ports: [{containerPort: 8099}]
         envFrom: [{secretRef: {name: hsf-secrets}}]   # JWT_SECRET/DB_*
         resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {cpu: 500m, memory: 512Mi}}

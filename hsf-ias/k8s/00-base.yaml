@@ -42,7 +42,7 @@ spec:
   hard:
     requests.cpu: "12"        # CONVENTIONS §2.15 冻结值；基础负载仅占 ~19%（06 号 §8.2），余量给 HPA/压测 Job
     requests.memory: 24Gi
-    limits.cpu: "36"          # W-2（docs/08 §6，CONVENTIONS-P3）：32→36——三期 rs(1C)+uplink(0.5C) limits 增量；当前 used≈26.5C，36 上限仍留 ≥9C 给其他租户
+    limits.cpu: "36"          # W-2（docs/08 §5，CONVENTIONS-P3）：32→36——三期 rs(1C)+uplink(0.5C) limits 增量；当前 used≈26.5C，36 上限仍留 ≥9C 给其他租户。范围仅本命名空间（hsf-dev-quota 维持 32，§2.15 冻结值）
     limits.memory: 48Gi       # CONVENTIONS §2.15 冻结值
     persistentvolumeclaims: "10"
     pods: "60"
@@ -74,7 +74,7 @@ spec:
   hard:
     requests.cpu: "12"        # dev 与 prod 同配额池（02 号 §5.1：同构、副本减半）
     requests.memory: 24Gi
-    limits.cpu: "36"
+    limits.cpu: "32"          # W-2 范围=仅 hsf-prod-quota（docs/08 §5，CONVENTIONS-P3）：dev 未部署三期新增服务，维持 CONVENTIONS §2.15 冻结值 32——勿同步上调（45C 集群 prod+dev limits 双计未评估；2026-11-13 评审修订回退）
     limits.memory: 48Gi
     pods: "60"
 ---
