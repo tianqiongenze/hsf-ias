@@ -77,3 +77,46 @@ def test_register_metric_and_parcel_contract(mock_db):
     assert sensor_args[0] == "S5306001101" and sensor_args[1] == "wind_speed"
     assert sensor_args[2] == "53060010101" and sensor_args[3] is None
     assert out["parcelCode"] is None
+
+
+# ── R-18（docs/24 §4，审核缺口#8）：设备凭证 CSPRNG 化 ────────────────────────────
+
+def test_register_credential_csprng_differs_across_sessions(mock_db):
+    """同码两次注册会话（mock 放行幂等检查）→ secret 互异（CSPRNG 不可预测性，R-18 验收③）。"""
+    q, e = mock_db
+    q.side_effect = [None, None, None, None]     # 两轮注册的台账+凭证幂等检查均放行
+    s1 = repo.register_device("S5306001099", "soil_moisture", "53060010101",
+                              "L5306000001")["mqttPassword"]
+    s2 = repo.register_device("S5306001099", "soil_moisture", "53060010101",
+                              "L5306000001")["mqttPassword"]
+    assert s1 != s2, "两次会话生成的凭证必须互异（随机盐不可复现）"
+    assert len(s1) == len(s2) == 16              # SM3 截断长度契约不变
+
+
+def test_register_credential_not_time_derived(mock_db):
+    """冻结时钟下连续两次注册 → secret 仍互异——证明盐非时间派生
+    （原实现 salt=now()strftime 在本测试下两次同盐同凭证，即 R-18 修复判据）。"""
+    q, e = mock_db
+    q.side_effect = [None, None, None, None]
+    with mock.patch("app.repo.dt") as fake_dt:
+        fake_dt.datetime.now.return_value = fake_dt.datetime(
+            2026, 11, 14, 12, 0, 0, 0)           # 时钟完全冻结（含微秒）
+        s1 = repo.register_device("S5306001102", "air_temp", "53060010101",
+                                  None)["mqttPassword"]
+        s2 = repo.register_device("S5306001102", "air_temp", "53060010101",
+                                  None)["mqttPassword"]
+    assert s1 != s2, "时钟冻结下凭证仍应互异（盐=CSPRNG 非时间戳，R-18）"
+
+
+def test_register_storage_side_unchanged_after_csprng(mock_db):
+    """R-18 存储侧不回归：device_cred 仍只存 SM3 摘要 + sha256 前 8 位 hint（docs/08 §4 口径），
+    响应仍含 16 位明文凭证一次下发。"""
+    q, e = mock_db
+    q.side_effect = [None, None]
+    out = repo.register_device("S5306001103", "rainfall", "53060010101", None)
+    pwd = out["mqttPassword"]
+    cred_args = e.call_args_list[1].args[1]
+    assert cred_args[1] == sm3(pwd.encode())                       # SM3 摘要
+    assert cred_args[2] == hashlib.sha256(pwd.encode()).hexdigest()[:8]   # sha256 hint
+    assert len(pwd) == 16
+    assert pwd not in json.dumps(cred_args, default=str)           # 明文不落库

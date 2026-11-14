@@ -42,6 +42,14 @@ spec:
         # PG 参数 timezone（docs/07 §3.1；args 透传给镜像入口的 postgres 进程）
         args: ["-c", "timezone=Asia/Shanghai"]
         resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: "2", memory: 2Gi}}   # docs/07 §1.3
+        # R-21 startupProbe（docs/24 §4 R-21 实施路径②：timescale 属慢启动清单）——首次 initdb
+        # 与 10Gi PV 崩溃恢复窗口远超 readiness/liveness 现有 60s/120s 容忍（本文件原注释口径），
+        # 覆盖窗 10s×30=300s：窗口内 readiness/liveness 暂停，超窗未通过按启动失败重启；
+        # pg_isready 同冻结形态（docs/07 §3.1，无 HTTP 端点故用 exec 探针）
+        startupProbe:
+          exec: {command: ["pg_isready", "-U", "hsf", "-d", "hsf_ts"]}
+          periodSeconds: 10
+          failureThreshold: 30
         # 探针 pg_isready（docs/07 §3.1 冻结形态；无 HTTP 端点故用 exec 探针）
         readinessProbe:
           exec: {command: ["pg_isready", "-U", "hsf", "-d", "hsf_ts"]}

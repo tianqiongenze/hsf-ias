@@ -171,42 +171,69 @@ def alerts_list(rule_code: str, page: int, size: int, role: str | None) -> dict:
     return {"total": int(total), "page": page, "size": size, "items": items}
 
 
+def _trig_time_with_parcel_offset(acq: str, parcel_idx: int) -> str:
+    """R-13 方案 b（docs/24 §4；docs/23 复核附录#12 多地块预警静默丢失修复）：
+    trig_time = 触发读数 acquired_at + 景内地块序号 × 1000 微秒。
+
+    机理：uk_rule_reading(sensor_code, rule_code, trig_time) 库级唯一键下，同景多地块降幅时
+    sensor_code（RS-<scene> 每景同值）与 trig_time（每景同取 acquired_at）全同 → 覆盖 parcel
+    粒度 NOT EXISTS → 仅落首条、其余静默丢失。偏移使幂等键内嵌地块序号，不改 DDL
+    （D-08-1 存量零变更红线）、存量数据不迁移。
+    步长取 1000μs（=1ms）：冻结 DDL trig_time 为 DATETIME(3) 毫秒精度，亚毫秒偏移会被列取整
+    折叠回同值，1ms/地块在列精度下保持可辨识；sensor_code 已内嵌 scene_code → 唯一性按景内
+    判定，降幅地块 >1000 时偏移溢出到 acquired_at 秒级之后，键仍单调可辨识。
+    序号取景内全部地块（parcel_code 排序）而非仅降幅子集——阈值重标定改变降幅集合时序号
+    稳定，重解译/重放 INSERT IGNORE 幂等去重语义不变（docs/08 §2.3 重载口径声明，R-14）。
+    """
+    base = dt.datetime.strptime(acq, "%Y-%m-%d %H:%M:%S")
+    return (base + dt.timedelta(microseconds=1000 * parcel_idx)).strftime(
+        "%Y-%m-%d %H:%M:%S.%f")[:23]
+
+
 def ndvi_fall_alerts(vigors: list[dict], scene_code: str, acquired_at: str) -> int:
-    """非农化预警：相邻两景降幅判定 → alert_record + notify（复用二期管道，D-08-1 §2.3）。"""
+    """非农化预警：相邻两景降幅判定 → alert_record + notify（复用二期管道，D-08-1 §2.3）。
+
+    R-13 落库粒度：trig_time 按景内确定性地块序偏移（见 _trig_time_with_parcel_offset），
+    同景多地块降幅各自落一行，不再被 uk_rule_reading 静默去重；重解译同序同偏移，幂等不变。"""
     # acquired_at 兼容 datetime（get_scene 返回 pymysql DATETIME 对象）与 str（seed 路径）——
     # 2026-11-14 部署实测 TypeError: 'datetime.datetime' object is not subscriptable 修复
     acq = (acquired_at.strftime("%Y-%m-%d %H:%M:%S")
            if hasattr(acquired_at, "strftime") else str(acquired_at))[:19]
+    # R-13：景内全地块确定性地块序（parcel_code 排序，与 ndvi.aggregate 输出序一致）
+    parcel_idx = {code: i for i, code in enumerate(sorted(v["parcel_code"] for v in vigors))}
     created = 0
     for v in vigors:
         prev = prev_mean(v["parcel_code"], acq)
         if not ndvi.fall_alerts(prev, v["ndvi_mean"]):
             continue
-        scene = db.query("SELECT id FROM hsf_biz.rs_scene WHERE scene_code=%s",
-                         (scene_code,), one=True)
+        trig_time = _trig_time_with_parcel_offset(acq, parcel_idx[v["parcel_code"]])
         n = db.execute(
-            # sensor_code=RS-<scene> 合成源标识（非真实传感器；截断 20 对齐冻结 DDL CHAR(20)）
+            # sensor_code=RS-<scene> 合成源标识（非真实传感器；截断 20 对齐冻结 DDL CHAR(20)）；
+            # trig_time=acquired_at+地块序号 1000μs 偏移（R-13 方案 b，docs/08 §2.3 重载口径）
             "INSERT IGNORE INTO hsf_biz.alert_record(rule_code,sensor_code,metric,trig_value,"
             "trig_time,village_code,parcel_code,state) "
             "SELECT 'RULE_NDVIFALL', %s, 'ndvi', %s, %s, "
             "COALESCE(l.village_code,''), l.code, 'OPEN' FROM hsf_md.land_parcel l "
             "WHERE l.code=%s AND NOT EXISTS(SELECT 1 FROM hsf_biz.alert_record r "
             "WHERE r.rule_code='RULE_NDVIFALL' AND r.parcel_code=%s AND r.trig_time=%s)",
-            (("RS-" + scene_code)[:20], v["ndvi_mean"], acq, v["parcel_code"],
-             v["parcel_code"], acq))
+            (("RS-" + scene_code)[:20], v["ndvi_mean"], trig_time, v["parcel_code"],
+             v["parcel_code"], trig_time))
         created += n
         if n:
             db.execute(
                 "INSERT INTO hsf_biz.domain_event(topic,payload) VALUES(%s,%s)",
                 ("rs.ndvi.fall", json.dumps({"parcel": v["parcel_code"], "scene": scene_code,
                                              "ndvi": v["ndvi_mean"]}, ensure_ascii=False)))
-            _notify(v, scene_code, prev)
+            _notify(v, scene_code, prev, trig_time)
     metrics.FALL_ALERTS.inc(created)
     return created
 
 
-def _notify(v: dict, scene_code: str, prev: float | None) -> None:
-    """预警通知（对齐二期 notify 契约：kind=ALERT，四角色行——村/乡镇口径）。"""
+def _notify(v: dict, scene_code: str, prev: float | None, trig_time: str) -> None:
+    """预警通知（对齐二期 notify 契约：kind=ALERT，四角色行——村/乡镇口径）。
+
+    R-13：按偏移后 trig_time 精确回查本地块 alert 行（原 _scene_acquired 按景查 acquired_at
+    在多地块偏移后不再命中本地块行）。"""
     title = "非农化预警"
     content = (f"地块 {v['parcel_code']} 遥感长势异常：NDVI 由 "
                f"{prev:.3f} 降至 {v['ndvi_mean']:.3f}（降幅超 0.15 且低于 0.30），"
@@ -220,13 +247,7 @@ def _notify(v: dict, scene_code: str, prev: float | None) -> None:
             "FROM hsf_biz.alert_record a WHERE a.rule_code='RULE_NDVIFALL' "
             "AND a.parcel_code=%s AND a.trig_time=%s LIMIT 1",
             (title, content, role, f"{scene_code}:{v['parcel_code']}:{role}",
-             v["parcel_code"], _scene_acquired(scene_code)))
-
-
-def _scene_acquired(scene_code: str) -> str:
-    row = db.query("SELECT acquired_at FROM hsf_biz.rs_scene WHERE scene_code=%s",
-                   (scene_code,), one=True)
-    return row["acquired_at"].strftime("%Y-%m-%d %H:%M:%S") if row else "1970-01-01 00:00:00"
+             v["parcel_code"], trig_time))
 
 
 def now_local() -> str:

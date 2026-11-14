@@ -15,6 +15,8 @@ for s in iam land project facility sim; do
     -v "$PWD/services/common/hsf_common":/srv/hsf_common \
     -e PYTHONPATH=/srv -e DB_HOST_WRITE=x:1 -e DB_HOST_READ=x:1 -e DB_USER=x -e DB_PASS=x \
     -e DB_USER_RO=x -e DB_PASS_RO=x -e REDIS_URL=x:1 -e REDIS_PASS=x \
+    -e JWT_SECRET=smoke-only-not-a-real-secret-0001 \
+    -e SM4_FIELD_KEY=$(printf 'a%.0s' $(seq 64)) \
     $BASE python -c "import sys; sys.path.insert(0,'/srv'); import app.main; print('IMPORT-OK $s')"
 done
 echo "✅ 全部服务导入冒烟通过"

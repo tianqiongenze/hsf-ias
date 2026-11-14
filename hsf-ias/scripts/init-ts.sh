@@ -2,8 +2,10 @@
 # HSF 二期 TimescaleDB 初始化（全幂等，可重复执行）——docs/07 §3.1~§3.5 冻结 DDL/策略
 # 步骤：等 pg_isready → 确认库 hsf_ts → CREATE EXTENSION timescaledb → 建 schema/hypertable/
 #       唯一索引（D-07-3：承接 MQTT QoS1 重复/补投）→ 连续聚合 5min/1h + 刷新/保留策略 →
-#       压缩策略 + 原始 90 天保留。全部语句 IF NOT EXISTS / if_not_exists => TRUE，
-#       重跑=核对既有对象（V2-04：策略 job 恒为 6 条 = 2 刷新 + 3 保留 + 1 压缩）
+#       压缩策略 + 原始 90 天保留 → 第 5 段 R-05 生效性复核（hypertable 压缩开关/策略 job
+#       在位/作业失败率/压缩参数/容量读数实查，缺失即幂等补齐）。全部语句 IF NOT EXISTS /
+#       if_not_exists => TRUE，重跑=核对既有对象（V2-04：策略 job 恒为 6 条 = 2 刷新 + 3 保留
+#       + 1 压缩）
 # 库/账号口径（docs/07 §3.1）：以 hsf/TIMESCALE_PASS 连 hsf_ts——与 iot TIMESCALE_DSN 同一 DSN，
 #   hsf 为超级用户（POSTGRES_USER 引导），CREATE EXTENSION 权限随之满足；密码缺省读 hsf-secrets
 # 执行方式（二选一）：
@@ -151,4 +153,94 @@ echo "── hypertable（应含 hsf_ts.sensor_reading）"
 tsql -X -A -t -d "$TS_DB" -c "SELECT hypertable_schema || '.' || hypertable_name FROM timescaledb_information.hypertables;"
 echo "── 策略 job（应恒 6 条 = 2 refresh + 3 retention + 1 compression，V2-04）"
 tsql -X -A -t -d "$TS_DB" -c "SELECT job_id || ':' || proc_name || ':' || hypertable_name FROM timescaledb_information.jobs ORDER BY job_id;"
-echo "✅ INIT-TS 全部通过（幂等初始化完成；重复执行为核对模式）"
+
+# ── 5. 压缩/保留策略生效性复核与缺失即补（R-05，docs/23 §7.4 / docs/24 §4 R-05）────
+# 背景：策略脚本级已冻结（第 3 段），但 live DB 是否实际生效、参数漂移、作业失败率未复核。
+# 本段全幂等：核对四点 → 漂移即补（压缩开关 / 策略 job 缺失重挂）→ 输出复核记录。
+echo "── R-05 生效性复核"
+
+COMP_ENABLED=$(tsql -X -A -t -d "$TS_DB" -c \
+  "SELECT COALESCE((SELECT compression_enabled::text FROM timescaledb_information.hypertables \
+    WHERE hypertable_schema='hsf_ts' AND hypertable_name='sensor_reading'), 'missing')" | tr -d '[:space:]')
+
+# 策略 job 在位数（排除 timescaledb 内置 telemetry/error-retention 三个 job）
+POLICY_JOBS=$(tsql -X -A -t -d "$TS_DB" -c \
+  "SELECT count(*) FROM timescaledb_information.jobs \
+    WHERE proc_name IN ('policy_refresh_continuous_aggregate','policy_retention','policy_compression')" \
+  | tr -d '[:space:]')
+
+# 策略作业失败率（recent runs 非 fail 口径：total_failures>0 即告警行，不自动重跑作业）
+FAILED_JOBS=$(tsql -X -A -t -d "$TS_DB" -c \
+  "SELECT count(*) FROM timescaledb_information.job_stats \
+    WHERE job_id IN (SELECT job_id FROM timescaledb_information.jobs \
+      WHERE proc_name IN ('policy_refresh_continuous_aggregate','policy_retention','policy_compression')) \
+      AND total_failures > 0" | tr -d '[:space:]')
+
+# 缺失即补 ①：压缩未启用（或视图缺行）→ 重跑第 3 段等价守卫块（幂等：已启用则跳过 SET）
+if [ "$COMP_ENABLED" != "t" ]; then
+  echo "INIT-TS-WARN | sensor_reading compression_enabled=$COMP_ENABLED（期望 t）→ 幂等补齐压缩"
+  tsql -X -v ON_ERROR_STOP=1 -d "$TS_DB" <<'SQL'
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM timescaledb_information.hypertables
+    WHERE hypertable_schema = 'hsf_ts' AND hypertable_name = 'sensor_reading'
+      AND compression_enabled
+  ) THEN
+    ALTER TABLE hsf_ts.sensor_reading SET (
+      timescaledb.compress,
+      timescaledb.compress_segmentby = 'device_code, metric',
+      timescaledb.compress_orderby   = 'recorded_at DESC');
+  END IF;
+END $$;
+SQL
+else
+  echo "INIT-TS-OK | sensor_reading compression_enabled=t"
+fi
+
+# 缺失即补 ②：6 条策略 job 缺失 → 幂等重挂（if_not_exists=TRUE，全部 no-op 若已在位）
+if [ "$POLICY_JOBS" -lt 6 ]; then
+  echo "INIT-TS-WARN | 策略 job 在位=$POLICY_JOBS（期望 6）→ 幂等补挂缺失策略"
+  tsql -X -v ON_ERROR_STOP=1 -d "$TS_DB" <<'SQL'
+SELECT add_continuous_aggregate_policy('hsf_ts.sensor_reading_5min',
+       start_offset => INTERVAL '3 hours', end_offset => INTERVAL '5 minutes',
+       schedule_interval => INTERVAL '10 minutes', if_not_exists => TRUE);
+SELECT add_retention_policy('hsf_ts.sensor_reading_5min', INTERVAL '90 days', if_not_exists => TRUE);
+SELECT add_continuous_aggregate_policy('hsf_ts.sensor_reading_1h',
+       start_offset => INTERVAL '1 day', end_offset => INTERVAL '1 hour',
+       schedule_interval => INTERVAL '1 hour', if_not_exists => TRUE);
+SELECT add_retention_policy('hsf_ts.sensor_reading_1h', INTERVAL '3 years', if_not_exists => TRUE);
+SELECT add_compression_policy('hsf_ts.sensor_reading', INTERVAL '1 day', if_not_exists => TRUE);
+SELECT add_retention_policy('hsf_ts.sensor_reading',   INTERVAL '90 days', if_not_exists => TRUE);
+SQL
+else
+  echo "INIT-TS-OK | 策略 job 在位=$POLICY_JOBS（2 refresh + 3 retention + 1 compression）"
+fi
+
+# ③ 压缩参数实查（segmentby/orderby 漂移仅报告不自动改——已启用压缩后改参需逐 chunk 重组，
+#    属破坏性动作，须 R-22 备份先行+评审；此处确保可发现）
+tsql -X -A -t -d "$TS_DB" -c \
+  "SELECT 'compress-setting | ' || attname || ' | segmentby=' || COALESCE(segmentby_column_index::text,'-') \
+     || ' orderby=' || COALESCE(orderby_column_index::text,'-') || CASE WHEN orderby_asc THEN ' ASC' ELSE ' DESC' END \
+   FROM timescaledb_information.compression_settings \
+   WHERE hypertable_schema='hsf_ts' AND hypertable_name='sensor_reading' \
+   ORDER BY COALESCE(segmentby_column_index, 99), orderby_column_index;" \
+  || echo "INIT-TS-WARN | compression_settings 查询失败（压缩未启用？）"
+
+# ④ 作业健康：策略作业存在失败记录即告警（recent runs 非 fail 口径；修复=排查后手动 run_job）
+if [ "$FAILED_JOBS" -gt 0 ]; then
+  echo "INIT-TS-WARN | $FAILED_JOBS 条策略作业存在失败记录（timescaledb_information.job_stats.total_failures>0）→ 人工排查"
+else
+  echo "INIT-TS-OK | 策略作业无失败记录（total_failures 全 0）"
+fi
+
+# ⑤ 容量复核记录（行数/chunk 压缩进度/库体积——每次执行留档，供磁盘增量曲线与八维读数更新）
+tsql -X -A -t -d "$TS_DB" -c \
+  "SELECT 'capacity | sensor_reading rows=' || c.rows || ' | chunks(compressed/total)=' \
+            || c.compressed || '/' || c.total || ' | db_size=' || pg_size_pretty(pg_database_size('hsf_ts')) \
+   FROM (SELECT (SELECT count(*) FROM hsf_ts.sensor_reading) AS rows, \
+                (SELECT count(*) FILTER (WHERE is_compressed) FROM timescaledb_information.chunks \
+                  WHERE hypertable_name='sensor_reading') AS compressed, \
+                (SELECT count(*) FROM timescaledb_information.chunks \
+                  WHERE hypertable_name='sensor_reading') AS total) c;"
+echo "✅ INIT-TS 全部通过（幂等初始化 + R-05 生效性复核完成；重复执行为核对/修复模式）"

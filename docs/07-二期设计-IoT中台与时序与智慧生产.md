@@ -76,10 +76,14 @@ TiDB(既有) :4000 ── hsf_md/hsf_biz 读写照旧；hsf_ts 二期零写入�
 
 | 新键 | 值 | 使用方 |
 |---|---|---|
-| `MQTT_PASS` | `<gen>`（mosquitto_passwd 派生） | sim、iot（MQTT_USER=hsf 固定）、mosquitto initContainer |
+| `MQTT_PASS` | `<gen>`（mosquitto_passwd 派生） | sim、iot（MQTT_USER=hsf 固定）、mosquitto initContainer。**R-20 修订（ADR-HSF-018，2026-11-14）**：本键语义收窄为 mosquitto initContainer 初始化运维账号 `hsf`（回退开关保留；sim/iot 改分账号键 `MQTT_PASS_SIM`/`MQTT_PASS_IOT`） |
+| `MQTT_PASS_SIM` | `<gen>` | sim 发布者账号 `hsf-sim`（仅 `topic write hsf/sensor/#`，R-20 增键 2026-11-14，ADR-HSF-018） |
+| `MQTT_PASS_IOT` | `<gen>` | iot 订阅者账号 `hsf-iot`（仅 `topic read hsf/sensor/#` + `$SYS/broker/#` 只读，R-20 增键 2026-11-14，ADR-HSF-018） |
 | `TIMESCALE_PASS` | `<gen>` | iot（TIMESCALE_DSN=postgresql://hsf:{pass}@hsf-timescale:5432/hsf_ts）、init-ts.sh、hsf-timescale StatefulSet（`POSTGRES_PASSWORD`，引导口径见 §3.1） |
+| `SM4_FIELD_KEY` | `<gen>`（32 字节 hex=64 字符，R-06 增键 2026-11-14） | iam（phone_enc 加解密）、facility（contact_enc 加解密）；`hsf_common/crypto.py` fail-closed 校验（env 缺失/非 32 字节 hex 启动即失败，源码不内置回退密钥）；轮换流程见 CONVENTIONS §2.17（存量密文旧键解密→新键重加密迁移） |
 
 其余键（DB_*/REDIS_*/JWT_SECRET）沿用；iot/ratelimit 继续 `envFrom: hsf-secrets`（sim 模式一致，`20-services.yaml:209`）。
+**R-07 真值出库增补（2026-11-14）**：本节及 docs/04 §7.3 的 `<gen>` 值一律不入 manifest——`00-base.yaml`/`10-redis.yaml` Secret 密钥键改空占位符，部署期由 `scripts/gen-secrets.sh`（部署机 CSPRNG 生成，`k8s/gen/` 不入 git）注入三处 Secret（hsf-prod/hsf-dev/infra）；JWT_SECRET prod/dev 强制分值，其余共享单实例键两 ns 同值（组件级分值需独立实例，显式声明）；部署顺序 00-base → 10-redis → gen-secrets.sh → 20-services（CONVENTIONS §2.18）。**R-31 增补（ADR-HSF-027，2026-11-14）**：Secret 键清单增 JWT 签名密钥族（JWT_ALG/JWT_KID/JWT_PRIVATE_KEY/JWT_PUBLIC_KEY/_PREV，RSA-2048 prod/dev 分值，值=PEM 的 base64 单行）——JWT_ALG=HS256 默认（冻结兼容开关），RS256 cutover 步骤见 ADR-HSF-027 影响列。
 
 ---
 
@@ -129,10 +133,10 @@ TiDB(既有) :4000 ── hsf_md/hsf_biz 读写照旧；hsf_ts 二期零写入�
 | 项 | 冻结值 |
 |---|---|
 | 监听 | `listener 1883 0.0.0.0`，`allow_anonymous false`（明文，A-07-1） |
-| 账号 | 单账号 `hsf`；密码 = Secret `MQTT_PASS` |
-| 密码文件 | initContainer 执行 `mosquitto_passwd -b -c /mosquitto/data/passwd hsf "$MQTT_PASS"`（PVC 内，幂等覆盖，密码不落 ConfigMap） |
-| ACL（ConfigMap `acl` 键） | `user hsf` / `topic readwrite hsf/sensor/#`——sim 只需 pub、iot 只需 sub，单一 readwrite 账号即可满足且避免两账号密钥分发 |
-| mosquitto.conf | `listener 1883 0.0.0.0` / `allow_anonymous false` / `password_file /mosquitto/data/passwd` / `acl_file /mosquitto/config/acl` / `persistence true` / `persistence_location /mosquitto/data/` / `max_queued_messages 10000` / `max_inflight_messages 100` |
+| 账号 | **分账号（ADR-HSF-018，2026-11-14 修订原单账号口径）**：`hsf-sim`（sim，密码=Secret `MQTT_PASS_SIM`）/ `hsf-iot`（iot，密码=Secret `MQTT_PASS_IOT`）；旧单账号 `hsf`（密码=Secret `MQTT_PASS`）保留在 passwd 仅作回退开关（ACL 不再授权 sensor 读写，回退=恢复 `user hsf / topic readwrite hsf/sensor/#` 一行）；真实设备以 deviceCode 为 username（docs/08 §4） |
+| 密码文件 | initContainer：passwd 缺失时 `mosquitto_passwd -b -c ... hsf "$MQTT_PASS"` 初始化；已存在时对 `hsf-sim`/`hsf-iot` **幂等追加**（禁 `-c`，保护 dep-device.sh 设备条目——docs/08 §4 规格①②） |
+| ACL（ConfigMap `acl` 键） | `user hsf-sim` / `topic write hsf/sensor/#`；`user hsf-iot` / `topic read hsf/sensor/#` + `topic read $SYS/broker/#`（R-03 采集最小授权）；`pattern readwrite hsf/sensor/%u/#`（设备 own-topic）——读写分离最小授权（R-20，2026-11-14；原"单账号 readwrite"口径经 ADR-HSF-018 废止）；下行 topic `hsf/cmd/#` 三期内不放开 |
+| mosquitto.conf | `listener 1883 0.0.0.0` / `allow_anonymous false` / `password_file /mosquitto/data/passwd` / `acl_file`（PVC 路径，属主校验） / `persistence true` / `persistence_location /mosquitto/data/` / `max_queued_messages 100000`（R-03 再平衡）/ `max_inflight_messages 1000`（W-1）/ `sys_interval 10`（R-03） |
 | 镜像/部署 | `eclipse-mosquitto:2.1` → `10.167.2.175:30500/base/mosquitto:2.1`；StatefulSet `hsf-mosquitto` 1 副本 + PVC 1Gi（local-path）+ Service `hsf-mqtt:1883`（T-2） |
 
 ### 2.5 sim 发布器与 iot 订阅者职责边界（冻结）
@@ -470,6 +474,16 @@ cost>1   （E2E/验证用）：同脚本 INCRBY cost 一次计入——等价 N 
 | 固有语义声明 | 固定窗口存在窗口边界突刺（相邻窗口各打满 = 瞬时 2×cap）；一期令牌桶的"补充速率"语义不延续——两种口径差异在验收与容量模型中按固定窗口理解 |
 | 键空间 | 前缀 `hsf:rl:`（`hsf:` 统一前缀惯例，04 §8.2）；TTL 120s 自清理，不占长期内存 |
 | 部署 | Deployment 2 副本（无状态、Redis 侧天然共享）；ClusterIP；requests cpu 150m/mem 256Mi，limits cpu 1/mem 512Mi |
+
+**窗口模式演进增补（R-25，2026-11-14，ADR-HSF-025——冻结表不修改，增补行如下）**：
+
+| 项 | 内容 |
+|---|---|
+| env `RATE_MODE2` | ratelimit-svc 窗口模式选择：`fixed`（**默认**，上表冻结语义一字不改）/`sliding`（滑动窗口可选演进，消窗口交界 2×cap 突刺）——默认值保证一期冻结契约不破坏，429 确定性复现口径不变 |
+| sliding 实现 | ZSET 按时间戳记成员：Lua 原子（`ZREMRANGEBYSCORE` 剔窗外旧成员 + `ZADD` cost 个唯一成员 + `ZCARD` + `EXPIRE 120`）——任意 60s 滑窗内通过 ≤cap；被拒请求同样计入成员（对齐固窗"拒绝计数仍累计"语义，防重试风暴放大）；member=调用方 uuid4（同 ms 并发不互踩） |
+| sliding 键格式 | `hsf:rl:{key}:slide`（与固窗 `hsf:rl:{key}:{分钟epoch}` **隔离**——两模式不得共用键名，避免 STRING/ZSET 类型冲突；模式切换后旧键 TTL 120s 自清）；响应契约 `{allowed, remain}` 与固窗逐字段一致，gw 零感知 |
+| 内存评估 | 每成员 ~60B × cap 1200 ≈ 72KB/键（score 8B+member 16B+skiplist 开销），TTL 120s 自清——O(1) 计数（INCR）换突刺消除，量级可接受 |
+| 验收 | 单测：滑窗 cap 边界/跨界不放新鲜额度（固窗对照同场景 t=+2.5s 必放行=2×cap 突刺）/出窗滑动恢复/键隔离/cost=1200；集群级"单 pod 1500 并发突发相邻窗口合计 ≤1.2×cap"与跨副本六步（§5.4）复测为准 |
 
 ### 5.2 gw 集成（gw:2.0，冻结）
 

@@ -6,6 +6,7 @@ clean_session=False，client_id=hsf-iot-0，重连 1s→30s 退避——docs/07 
 """
 import datetime as dt
 import json
+import os
 import threading
 
 import paho.mqtt.client as mqtt
@@ -18,29 +19,58 @@ CLIENT_ID = "hsf-iot-0"
 SUBSCRIBE_QOS = 1
 KEEPALIVE = 30
 
+# R-01 有界缓冲（docs/24 §4 R-01 approach ③：原 ReadingsBuffer 为无界 list append——
+# TimescaleDB 长时间不可用叠加高速流时有 OOM 风险）。溢出=丢最新一条+计数（保序、
+# 不阻塞 MQTT 回调线程；对齐对标②"回调只入队+有界队列背压"）。
+BUFFER_MAX_DEFAULT = 100000
+
+
+def buffer_max() -> int:
+    """缓冲上限（env IOT_BUFFER_MAX，缺省 10 万条 ≈ 稳态 24 条/s 下 69 分钟、
+    5,000 条/s 下 20s 的背压余量；0=无界=旧行为回退）。"""
+    return max(0, int(os.environ.get("IOT_BUFFER_MAX", str(BUFFER_MAX_DEFAULT))))
+
 
 class ReadingsBuffer:
-    """线程安全读数缓冲：MQTT 回调线程 append，刷写线程 swap/put_front。"""
+    """线程安全读数缓冲：MQTT 回调线程 append，刷写线程 swap/put_front。
 
-    def __init__(self):
+    R-01：可选有界（maxlen>0）——满时拒绝新条目（丢最新）并回调 on_drop 计数；
+    maxlen=0（缺省由 IOT_BUFFER_MAX 决定）=无界=旧行为。"""
+
+    def __init__(self, maxlen: int = 0, on_drop=None):
         self._items: list[tuple] = []
         self._lock = threading.Lock()
+        self._maxlen = max(0, int(maxlen))
+        self._on_drop = on_drop
 
     def append(self, row: tuple) -> int:
         with self._lock:
+            if self._maxlen and len(self._items) >= self._maxlen:
+                if self._on_drop:
+                    self._on_drop()
+                metrics.BUFFER_SIZE.set(len(self._items))
+                return len(self._items)            # 满：丢弃新条目（背压计数，保序不动旧数据）
             self._items.append(row)
+            metrics.BUFFER_SIZE.set(len(self._items))
             return len(self._items)
 
-    def swap(self) -> list[tuple]:
-        """原子取走全部缓冲（刷写线程独占调用）。"""
+    def swap(self, on_take=None) -> list[tuple]:
+        """原子取走全部缓冲（刷写线程独占调用）。
+
+        on_take(items)：R-01 评估旁路提交回调——在缓冲锁内同步执行（BatchQueue.put 不阻塞，
+        仅丢最旧），保证 swap 顺序=评估入队顺序=消息到达顺序（回差状态机逐设备时序契约）。"""
         with self._lock:
             items, self._items = self._items, []
+            if on_take is not None and items:
+                on_take(items)
+        metrics.BUFFER_SIZE.set(0)
         return items
 
     def put_front(self, rows: list[tuple]) -> None:
         """刷写失败整批回队（保序放回队首，幂等键保证重试不重复落库）。"""
         with self._lock:
             self._items = list(rows) + self._items
+            metrics.BUFFER_SIZE.set(len(self._items))
 
     def __len__(self) -> int:
         with self._lock:

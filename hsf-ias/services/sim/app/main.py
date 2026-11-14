@@ -16,7 +16,7 @@ import jwt
 from fastapi import Depends, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from hsf_common.web import create_app
+from hsf_common.web import create_app, decode_token
 
 from . import mqtt_pub, repo
 
@@ -53,7 +53,7 @@ def require_login(authorization: str = Header(default="")) -> dict:
     if not token:
         raise _http_err(401, "UNAUTHENTICATED", "请先登录")
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        payload = decode_token(token)   # R-31：统一验签入口（HS256 冻结路径 / JWT_ALG=RS256 公钥验签）
     except Exception:
         raise _http_err(401, "UNAUTHENTICATED", "凭据无效或已过期")
     return {"user_id": int(payload.get("sub") or 0),

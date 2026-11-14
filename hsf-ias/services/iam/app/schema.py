@@ -201,5 +201,12 @@ def _audit_login(info, r, action: str, phone: str):
 
 
 # §2.4 强制：显式 types 注册——未注册实体不进 SDL，网关组合直接 400（DV-IAS 真实生产事故）
-schema = strawberry.federation.Schema(query=Query, mutation=Mutation,
-                                      types=[Party, Organization], enable_federation_2=True)
+# enable_federation_2=True 为冻结契约参数（R-12，CONVENTIONS §2.4/docs/05 §1.2）。
+# strawberry-graphql ≥0.26 移除该参数（Federation 2 为默认形态）——钉版 0.254.1
+# （requirements-base.txt）走显式参数分支；新版本走默认 F2 分支，形态契约不变。
+try:
+    schema = strawberry.federation.Schema(query=Query, mutation=Mutation,
+                                          types=[Party, Organization], enable_federation_2=True)
+except TypeError:  # pragma: no cover —— strawberry-graphql≥0.26：参数移除，F2 默认启用
+    schema = strawberry.federation.Schema(query=Query, mutation=Mutation,
+                                          types=[Party, Organization])

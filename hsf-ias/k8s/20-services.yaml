@@ -8,6 +8,21 @@
 # 二期 iot=31213（T-3 端口分配，上线前仍须 ss -tln 核验）。
 # hsf-dev 同构部署：副本减半 + sed 's/hsf-prod/hsf-dev/g' 后另行 apply（本文件只冻结 prod）
 # 镜像统一来自集群私有仓库 10.167.2.175:30500/hsf/*；二期重建镜像统一 tag 2.0（T-2，部署阶段随构建更新）
+# 阶段 0 安全止血 patch（2026-11-14，docs/24 R-06/R-07/R-08）：iam 1.0.1→1.0.2、facility 1.0.1→1.0.2
+#   （SM4 fail-closed + JWT TTL 2h + JWT_SECRET 回退消除）、gw 3.0.2→3.0.3（JWT_SECRET 回退消除）；
+#   iam/facility 显式注入 SM4_FIELD_KEY（envFrom 全量注入之外的显式依赖声明）；其余服务 tag 不动，
+#   其镜像内旧回退常量在下次 patch 构建窗口统一消除（运行时 env 注入已覆盖，见 CONVENTIONS §2.18）
+# 阶段 4 治理与对标 patch（2026-11-14，docs/24 R-24~R-27/R-31）：gw 3.0.3→3.0.4（查询深度护栏
+#   ADR-026 + INTROSPECTION env R-27 + verifyJwt RS256 支持 R-31）、iam 1.0.2→1.0.3（issue_token
+#   JWT_ALG 开关 R-31）、ratelimit 2.0→2.0.1（RATE_MODE2 滑窗可选 R-25）、uplink 3.0.5→3.0.6
+#   （payload geoWkt/schemaVersion 1.2 R-24）；iot/rs/sim tag 不动（R-31 验签代码已入工作区，
+#   JWT_ALG=HS256 默认下旧镜像行为不变，切换 RS256 的 cutover 窗口统一重建）
+# 镜像部署窗口（2026-11-15，dockerd 恢复 docs/22 §10 恢复步骤执行）：TAG=3.0.6 统一构建
+#   gw/sim/iot/rs/uplink（阶段 0-4 实际变更集：R-01/R-02/R-03/R-18/R-24/R-26/R-27/R-31 代码 +
+#   hsf_common R-06/R-07/R-08 fail-closed 与统一验签入口）；iam:1.0.3/ratelimit:2.0.1 直建
+#   （1.0.x/2.0.x tag 线，U-2 口径）；web 无代码变更维持 3.0；land/project/facility 清单 tag 不动
+#   （schema.py try/except 为版本自适应，钉版 0.254.1 下行为一致；旧镜像回退常量由 env 注入覆盖，
+#   20-services 头注"下次 patch 构建窗口统一消除"顺延记录）。uplink 清单已是 3.0.6（镜像本窗口实建）。
 ---
 # ─── gw：Apollo 网关，业务 8090(GraphQL) + 探针 9090(/healthz；8090 是 GraphQL，/healthz 会 400——CONVENTIONS §2.5) ───
 apiVersion: apps/v1
@@ -27,10 +42,28 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: gw}}}
       containers:
       - name: gw
-        image: 10.167.2.175:30500/hsf/gw:3.0.2
+        # R-26/R-27/R-31（2026-11-14）：查询深度护栏+INTROSPECTION env+RS256 验签支持——3.0.3→3.0.4 patch；
+        # 2026-11-15 部署窗口（dockerd 恢复后统一收口）：3.0.4 曾受 docs/22 §10 构建阻塞未入库，
+        # 本窗口 TAG=3.0.6 SVCS 构建推送后顺延 3.0.4→3.0.6（同窗口 iot/sim/rs patch 对齐）
+        image: 10.167.2.175:30500/hsf/gw:3.0.6
         ports: [{containerPort: 8090}, {containerPort: 9090}]
         env:
         - {name: JWT_SECRET, valueFrom: {secretKeyRef: {name: hsf-secrets, key: JWT_SECRET}}}
+        # R-31（2026-11-14，ADR-HSF-027）：JWT 验签密钥族——JWT_ALG=HS256 默认（冻结兼容开关，
+        # 切 RS256 仅改 Secret 该键值并滚动）；JWT_PUBLIC_KEY/PREV=验签公钥（base64(PEM) 单行，
+        # gen-secrets.sh RSA-2048 生成）；JWT_KID(_PREV)=令牌头 kid 选择（轮换窗口双公钥）。
+        # HS256 模式下本组 env 不生效（verifyJwt 走 JWT_SECRET 冻结路径）；私钥不注入 gw（最小授权）
+        - {name: JWT_ALG, valueFrom: {secretKeyRef: {name: hsf-secrets, key: JWT_ALG}}}
+        - {name: JWT_KID, valueFrom: {secretKeyRef: {name: hsf-secrets, key: JWT_KID}}}
+        - {name: JWT_PUBLIC_KEY, valueFrom: {secretKeyRef: {name: hsf-secrets, key: JWT_PUBLIC_KEY}}}
+        - {name: JWT_PUBLIC_KEY_PREV, valueFrom: {secretKeyRef: {name: hsf-secrets, key: JWT_PUBLIC_KEY_PREV}}}
+        - {name: JWT_KID_PREV, valueFrom: {secretKeyRef: {name: hsf-secrets, key: JWT_KID_PREV}}}
+        # R-27（2026-11-14，docs/24 §4 R-27）：生产关闭 introspection——docs/05 §1.4 冻结口径
+        # "内省 INTROSPECTION env 控制（dev 开/生产关）"的落地；gateway.js:101
+        # `introspection: process.env.INTROSPECTION !== 'false'`（默认开启）→ 显式注入 false 后
+        # __schema 查询被拒绝。演示环境口径（docs/24 R-27 实施记录）：hsf-dev 不注入本 env
+        # （dev 派生清单无此行 → 默认开启，便于演示/调试）；E2E 25/25 不依赖 introspection（回归验证）
+        - {name: INTROSPECTION, value: "false"}
         - name: SUBGRAPHS
           value: "iam=http://iam-svc.hsf-prod.svc.cluster.local:8091/graphql,land=http://land-svc.hsf-prod.svc.cluster.local:8092/graphql,project=http://project-svc.hsf-prod.svc.cluster.local:8093/graphql,facility=http://facility-svc.hsf-prod.svc.cluster.local:8094/graphql,rs=http://rs-svc.hsf-prod.svc.cluster.local:8098/graphql"
         # 二期限流改造（docs/07 §5.2/§5.3 env 冻结表）：判定移至 ratelimit-svc（Redis 固定窗口全局计数），
@@ -39,6 +72,11 @@ spec:
         - {name: RATE_SVC, value: "http://ratelimit-svc.hsf-prod.svc.cluster.local:8096"}
         - {name: RATE_CAP, value: "6000"}   # 仅 local 回退模式读取（进程内桶局部口径；一期重复键 1200/6000 已清理）
         resources: {requests: {cpu: 100m, memory: 384Mi}, limits: {cpu: "2", memory: 1Gi}}
+        # R-21 startupProbe（docs/24 §4 R-21 验收②判据要求 gw 命中）：Node 网关启动快但组合
+        # 子图列表初始化（SUBGRAPHS 5 子图 healthcheck）仍在 readiness 首个 5s 窗口内可见，
+        # startupProbe 同探针口径 9090 /healthz（双探针指向 9090 口径不变——本行只是把该
+        # /healthz 前移为启动门，60s 覆盖窗内 readiness/liveness 暂停，不改变原探针参数）
+        startupProbe: {httpGet: {path: /healthz, port: 9090}, periodSeconds: 5, failureThreshold: 12}
         readinessProbe: {httpGet: {path: /healthz, port: 9090}, periodSeconds: 5}
         livenessProbe: {httpGet: {path: /healthz, port: 9090}, initialDelaySeconds: 60, periodSeconds: 10}
 ---
@@ -62,6 +100,12 @@ spec:
   metrics:
   - type: Resource
     resource: {name: cpu, target: {type: Utilization, averageUtilization: 60}}
+  # R-21（docs/24 §4 R-21 实施路径③）：scaleDown 稳定窗口 300s——对齐一期 HPA 扩容滞后长尾
+  # 教训（docs/20 §3.4）：压测后负载骤降，缺省 scaleDown 稳定窗过短导致副本数抖动反复伸缩；
+  # scaleUp 不设 stabilizationWindowSeconds（保持缺省 0s 快速扩容口径，仅抑制抖动方向）
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
 ---
 # ─── iam：组织/账号/登录（联邦实体 Party 拥有者；种子幂等双守卫）───
 apiVersion: apps/v1
@@ -81,10 +125,20 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: iam-svc}}}
       containers:
       - name: app
-        image: 10.167.2.175:30500/hsf/iam:1.0.1
+        # R-31（2026-11-14，ADR-HSF-027）：issue_token 算法演进（JWT_ALG 开关）——1.0.2→1.0.3 patch；
+        # JWT_ALG/JWT_PRIVATE_KEY/JWT_KID 经 envFrom(hsf-secrets) 注入（R-31 增键，HS256 默认）
+        image: 10.167.2.175:30500/hsf/iam:1.0.3
         ports: [{containerPort: 8091}]
         envFrom: [{secretRef: {name: hsf-secrets}}]
+        env:
+        # R-06（2026-11-14）：SM4 字段加密显式注入（phone_enc 加解密消费方；envFrom 全量注入外的
+        # 显式声明，防止 envFrom 漏配静默回退——crypto.py fail-closed 缺失即启动失败）
+        - {name: SM4_FIELD_KEY, valueFrom: {secretKeyRef: {name: hsf-secrets, key: SM4_FIELD_KEY}}}
         resources: {requests: {cpu: 150m, memory: 256Mi}, limits: {cpu: "1", memory: 512Mi}}
+        # R-21 startupProbe（docs/24 §4 R-21 实施路径②）：Python+DB 连接池初始化慢启动，
+        # /healthz（不依赖 DB，CONVENTIONS §2.14）覆盖窗 5s×12=60s；窗口内 readiness/liveness
+        # 暂停生效，超窗未通过则按启动失败重启（不再依赖 liveness initialDelay 兜底）
+        startupProbe: {httpGet: {path: /healthz, port: 8091}, periodSeconds: 5, failureThreshold: 12}
         readinessProbe: {httpGet: {path: /readyz, port: 8091}, periodSeconds: 5, failureThreshold: 3}
         livenessProbe: {httpGet: {path: /healthz, port: 8091}, initialDelaySeconds: 20, periodSeconds: 10}
 ---
@@ -101,6 +155,10 @@ spec:
   minReplicas: 2
   maxReplicas: 4
   metrics: [{type: Resource, resource: {name: cpu, target: {type: Utilization, averageUtilization: 60}}}]
+  # R-21：scaleDown 稳定窗口 300s（口径同 gw-hpa，docs/20 §3.4 一期教训）
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
 ---
 # ─── land：地块主数据/一张图 GeoJSON（LandParcel @key code）───
 apiVersion: apps/v1
@@ -124,6 +182,8 @@ spec:
         ports: [{containerPort: 8092}]
         envFrom: [{secretRef: {name: hsf-secrets}}]
         resources: {requests: {cpu: 150m, memory: 256Mi}, limits: {cpu: "1", memory: 512Mi}}
+        # R-21 startupProbe（口径同 iam）：GeoJSON 主数据初始化慢启动，60s 覆盖窗
+        startupProbe: {httpGet: {path: /healthz, port: 8092}, periodSeconds: 5, failureThreshold: 12}
         readinessProbe: {httpGet: {path: /readyz, port: 8092}, periodSeconds: 5, failureThreshold: 3}
         livenessProbe: {httpGet: {path: /healthz, port: 8092}, initialDelaySeconds: 20, periodSeconds: 10}
 ---
@@ -154,6 +214,8 @@ spec:
         ports: [{containerPort: 8093}]
         envFrom: [{secretRef: {name: hsf-secrets}}]
         resources: {requests: {cpu: 150m, memory: 256Mi}, limits: {cpu: "1", memory: 512Mi}}
+        # R-21 startupProbe（口径同 iam）：7 态状态机建表自检慢启动，60s 覆盖窗
+        startupProbe: {httpGet: {path: /healthz, port: 8093}, periodSeconds: 5, failureThreshold: 12}
         readinessProbe: {httpGet: {path: /readyz, port: 8093}, periodSeconds: 5, failureThreshold: 3}
         livenessProbe: {httpGet: {path: /healthz, port: 8093}, initialDelaySeconds: 20, periodSeconds: 10}
 ---
@@ -180,10 +242,15 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: facility-svc}}}
       containers:
       - name: app
-        image: 10.167.2.175:30500/hsf/facility:1.0.1
+        image: 10.167.2.175:30500/hsf/facility:1.0.2
         ports: [{containerPort: 8094}]
         envFrom: [{secretRef: {name: hsf-secrets}}]
+        env:
+        # R-06（2026-11-14）：SM4 字段加密显式注入（contact_enc 加解密消费方，口径同 iam）
+        - {name: SM4_FIELD_KEY, valueFrom: {secretKeyRef: {name: hsf-secrets, key: SM4_FIELD_KEY}}}
         resources: {requests: {cpu: 150m, memory: 256Mi}, limits: {cpu: "1", memory: 512Mi}}
+        # R-21 startupProbe（口径同 iam）：设施台账建表自检慢启动，60s 覆盖窗
+        startupProbe: {httpGet: {path: /healthz, port: 8094}, periodSeconds: 5, failureThreshold: 12}
         readinessProbe: {httpGet: {path: /readyz, port: 8094}, periodSeconds: 5, failureThreshold: 3}
         livenessProbe: {httpGet: {path: /healthz, port: 8094}, initialDelaySeconds: 20, periodSeconds: 10}
 ---
@@ -210,13 +277,18 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: sim-svc}}}
       containers:
       - name: app
-        image: 10.167.2.175:30500/hsf/sim:3.0
+        # 2026-11-15 部署窗口：R-02 发布侧指标（mqtt_pub 队列/rc 计数）+R-31 decode_token——3.0→3.0.6
+        image: 10.167.2.175:30500/hsf/sim:3.0.6
         ports: [{containerPort: 8095}]
         envFrom: [{secretRef: {name: hsf-secrets}}]
         env:
-        # 二期 MQTT 发布者（T-2）：密码经 hsf-secrets 注入（user hsf@hsf-mqtt:1883，docs/07 §1.4）。
-        # sim 2.0 不连 TimescaleDB（时序写职责移交 iot，docs/07 §9-④⑤），故无 TIMESCALE_* env
-        - {name: MQTT_PASS, valueFrom: {secretKeyRef: {name: hsf-secrets, key: MQTT_PASS}}}
+        # 二期 MQTT 发布者（T-2）：密码经 hsf-secrets 注入（docs/07 §1.4）。
+        # R-20/ADR-HSF-018（2026-11-14）：分账号最小授权——sim 发布账号 hsf-sim（仅
+        # topic write hsf/sensor/#，MQTT_PASS_SIM 键）；MQTT_USER env 支持为二期既有实现
+        # （services/sim/app/main.py:40）。sim 2.0 不连 TimescaleDB（时序写职责移交 iot，
+        # docs/07 §9-④⑤），故无 TIMESCALE_* env
+        - {name: MQTT_USER, value: "hsf-sim"}
+        - {name: MQTT_PASS, valueFrom: {secretKeyRef: {name: hsf-secrets, key: MQTT_PASS_SIM}}}
         resources: {requests: {cpu: 250m, memory: 384Mi}, limits: {cpu: "2", memory: 1Gi}}
         readinessProbe: {httpGet: {path: /readyz, port: 8095}, periodSeconds: 5, failureThreshold: 3}
         livenessProbe: {httpGet: {path: /healthz, port: 8095}, initialDelaySeconds: 20, periodSeconds: 10}
@@ -283,12 +355,17 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: ratelimit-svc}}}
       containers:
       - name: app
-        image: 10.167.2.175:30500/hsf/ratelimit:2.0
+        # R-25（2026-11-14，ADR-HSF-025）：RATE_MODE2 窗口模式支持——2.0→2.0.1 patch
+        image: 10.167.2.175:30500/hsf/ratelimit:2.0.1
         ports: [{containerPort: 8096}]
         envFrom: [{secretRef: {name: hsf-secrets}}]   # REDIS_URL/REDIS_PASS（hsf-redis 集群，infra）
         env:
         # 窗口容量 req/min/键：docs/07 §5.1/§9-③ 二期冻结 1200——1500 突发必触发 429（§5.4 验证口径）
         - {name: RATE_CAP, value: "1200"}
+        # R-25（2026-11-14，ADR-HSF-025）：窗口模式 fixed=冻结固定窗口（默认，一期契约不破坏）；
+        # sliding=滑动窗口可选演进（ZSET 剔旧计数，消窗口交界 2×cap 突刺，键 {key}:slide 与固窗隔离）。
+        # 显式注入默认值=口径声明（回退/演进均改本行为 sliding，单行生效不改镜像）
+        - {name: RATE_MODE2, value: "fixed"}
         resources: {requests: {cpu: 150m, memory: 256Mi}, limits: {cpu: "1", memory: 512Mi}}
         readinessProbe: {httpGet: {path: /readyz, port: 8096}, periodSeconds: 5, failureThreshold: 3}
         livenessProbe: {httpGet: {path: /healthz, port: 8096}, initialDelaySeconds: 20, periodSeconds: 10}
@@ -318,17 +395,27 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: iot-svc}}}
       containers:
       - name: app
-        image: 10.167.2.175:30500/hsf/iot:3.0.5
+        # 2026-11-15 部署窗口：R-01 刷写多线程+R-03 BrokerSysMonitor+R-18 CSPRNG——3.0.5→3.0.6
+        # （docs/22 §10：iot:3.0.5 早于 R-01/R-03 指标代码，重建后 hsf_iot_buffer_size/
+        #  hsf_broker_messages_dropped_total 指标生效）
+        image: 10.167.2.175:30500/hsf/iot:3.0.6
         ports: [{containerPort: 8097}]
         envFrom: [{secretRef: {name: hsf-secrets}}]   # DB_*/REDIS_*/MQTT_PASS/TIMESCALE_PASS 全量注入（§1.4）
         env:
-        # 显式列出二期键（§1.4 冻结）：MQTT user=hsf@hsf-mqtt:1883；TIMESCALE_PASS 为三方共用密码键
-        - {name: MQTT_PASS, valueFrom: {secretKeyRef: {name: hsf-secrets, key: MQTT_PASS}}}
+        # 显式列出二期键（§1.4 冻结）；TIMESCALE_PASS 为三方共用密码键。
+        # R-20/ADR-HSF-018（2026-11-14）：分账号最小授权——iot 订阅账号 hsf-iot（仅
+        # topic read hsf/sensor/# + $SYS/broker/# 只读，MQTT_PASS_IOT 键；BrokerSysMonitor
+        # 经同一 MQTT_USER 走 hsf-iot）；MQTT_USER env 支持为二期既有实现
+        # （services/iot/app/main.py:25）。显式 env 优先于 envFrom 同名键（k8s 语义）
+        - {name: MQTT_USER, value: "hsf-iot"}
+        - {name: MQTT_PASS, valueFrom: {secretKeyRef: {name: hsf-secrets, key: MQTT_PASS_IOT}}}
         - {name: TIMESCALE_PASS, valueFrom: {secretKeyRef: {name: hsf-secrets, key: TIMESCALE_PASS}}}
         # TimescaleDB 连接串（§1.4 冻结形态）：密码引用上方 TIMESCALE_PASS（$(VAR) 仅展开先前显式 env；
         # envFrom 键不参与展开）。短名同命名空间解析，hsf-dev 同构 sed 派生无需替换
         - {name: TIMESCALE_DSN, value: "postgresql://hsf:$(TIMESCALE_PASS)@hsf-timescale:5432/hsf_ts"}
         resources: {requests: {cpu: 250m, memory: 384Mi}, limits: {cpu: "2", memory: 1Gi}}
+        # R-21 startupProbe（口径同 iam）：MQTT 订阅线程+TS 连接池+registry 刷新慢启动，60s 覆盖窗
+        startupProbe: {httpGet: {path: /healthz, port: 8097}, periodSeconds: 5, failureThreshold: 12}
         readinessProbe: {httpGet: {path: /readyz, port: 8097}, periodSeconds: 5, failureThreshold: 3}
         livenessProbe: {httpGet: {path: /healthz, port: 8097}, initialDelaySeconds: 20, periodSeconds: 10}
 ---
@@ -359,7 +446,9 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: rs-svc}}}
       containers:
       - name: app
-        image: 10.167.2.175:30500/hsf/rs:3.0.4
+        # 2026-11-15 部署窗口：R-12/R-13/R-15 已在 3.0.5 生效（docs/22 §9.3）；metrics 幂等注册
+        # 与 hsf_common 统一验签入口随窗口顺延 3.0.5→3.0.6
+        image: 10.167.2.175:30500/hsf/rs:3.0.6
         ports: [{containerPort: 8098}]
         envFrom: [{secretRef: {name: hsf-secrets}}]   # JWT_SECRET/DB_*（seed 与解译写 TiDB）
         resources: {requests: {cpu: 150m, memory: 384Mi}, limits: {cpu: "1", memory: 1Gi}}   # numpy 峰值内存放宽
@@ -393,7 +482,8 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: uplink-svc}}}
       containers:
       - name: app
-        image: 10.167.2.175:30500/hsf/uplink:3.0.5
+        # R-24（2026-11-14，ADR-HSF-024）：payload geoWkt+schemaVersion 1.2——3.0.5→3.0.6 patch
+        image: 10.167.2.175:30500/hsf/uplink:3.0.6
         ports: [{containerPort: 8099}]
         envFrom: [{secretRef: {name: hsf-secrets}}]   # JWT_SECRET/DB_*
         resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {cpu: 500m, memory: 512Mi}}

@@ -46,9 +46,12 @@ const IOT_WRITE = __ENV.SCENARIO === 'iot-write';
 const iotTickDur = new Trend('iot_tick_duration', true);
 const iotPublished = new Counter('iot_published');
 // iot /metrics 文本中解析 hsf_iot_readings_written_total（写侧落库累计，全链路口径）
+// R-04（docs/23 §6 P3-6）：prometheus_client 对 ≥1e6 计数器输出科学计数法（如 1.205557e+06），
+// 原 [0-9.]+ 在 'e' 处截断致 parseFloat 得 1.2 → teardown 吞吐行 0.0 条/s；字符类补 e/E/± 全量取数。
+// _created 直方图伴生行（hsf_iot_readings_written_total_created）因 _total 后非空白不会误匹配。
 function iotWritten() {
   const r = http.get(`${IOT}/metrics`);
-  const m = /hsf_iot_readings_written_total\s+([0-9.]+)/.exec(r.body || '');
+  const m = /hsf_iot_readings_written_total\s+([0-9.eE+-]+)/.exec(r.body || '');
   return m ? parseFloat(m[1]) : -1;
 }
 

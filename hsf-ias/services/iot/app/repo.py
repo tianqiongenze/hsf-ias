@@ -7,9 +7,11 @@
 边界（docs/07 §2.5）：sim 只造数发数；iot 是 TimescaleDB 唯一写入方、sensor.last_* 唯一
 维护方、alert_rule 种子唯一来源；TiDB hsf_ts 二期零写入（归档快照）。
 """
+import collections
 import datetime as dt
 import hashlib
 import json
+import secrets
 import threading
 import time
 
@@ -28,6 +30,12 @@ NOTIFY_ROLES = ("admin", "town", "village", "keeper")  # 推送面 4 角色，co
 
 # ── DDL（冻结；CREATE TABLE IF NOT EXISTS 对存量表零变更——D-07-8）────────────────
 # alert_record/alert_rule/domain_event：一期冻结 DDL 原样承接（一期 sim 建，二期 iot 落库方）
+# R-14 字段语义重载声明（docs/08 §2.3，仅本注释级，不改 DDL）——RS 非农化预警场景复用
+# alert_record 时：sensor_code 承载合成源标识 RS-<scene[:17]>（("RS-"+scene_code)[:20]，
+# 非真实传感器）、metric='ndvi'、trig_value=该地块 NDVI 均值；trig_time=R-13 方案 b
+# "触发读数 recorded_at + 地块序号微秒偏移"（景内 parcel_code 排序 ×1000μs/地块，
+# DATETIME(3) 列精度约束取 1ms 步长）——显式偏离下行冻结注释"触发读数的 recorded_at
+# （幂等键组成部分）"原语义，重载口径以 docs/08 §2.3 声明为准。
 DDL = [
     """CREATE TABLE IF NOT EXISTS hsf_biz.alert_record(
   id           BIGINT        NOT NULL AUTO_INCREMENT,
@@ -223,6 +231,14 @@ class LatestCache:
         self._d: dict[str, tuple[str, float, dt.datetime]] = {}  # device → (metric, value, ts)
 
     def put(self, device_code: str, metric: str, value: float, ts: dt.datetime):
+        # R-01（多 worker 并发刷写）：时间戳守卫——旧批后到不覆盖新值，保证 /sensor/latest
+        # "最新读数"语义（A-07-3）在多线程下不回退；同刻读数（QoS1 重复）仍正常覆盖。
+        hit = self._d.get(device_code)
+        try:
+            if hit is not None and hit[2] > ts:
+                return
+        except TypeError:               # aware/naive 混入防御：缓存面不让比较异常逃逸
+            pass
         self._d[device_code] = (metric, float(value), ts)
 
     def items(self, registry: SensorRegistry, village_code: str | None = None) -> list[dict]:
@@ -359,13 +375,82 @@ def rebuild_tripped(engine) -> int:
 
 
 # ── flush 管道（docs/07 §4.1：写时序 → latest 缓存 → last_* → 规则/决策）───────────
+# R-01（docs/24 §4 R-01 approach ①②）刷写/评估分层——冻结契约不破坏：
+#   flush_write()：时序落库 + latest 缓存 + sensor.last_*（刷写热路径，N 个 worker 并行，
+#                  FLUSH_WORKERS env 可调缺省 1=等价旧行为保回退）；
+#   evaluate()  ：规则引擎（回差状态机）+ 灌溉决策（评估旁路，独立节拍单线程串行消费）；
+#   flush()     ：flush_write+evaluate 组合 = EVAL_INLINE=1 回退路径（与改造前行为等价）。
+# 契约不变项：BATCH_MAX=500/FLUSH_INTERVAL=2.0（"500 条或 2s 先到者刷"，CONVENTIONS-P2 T-2/
+# docs/07 §4.1 冻结）；/sensor/latest 口径=A-07-3（每批写后更新，latest=最新读数语义由
+# LatestCache 时间戳守卫在多线程下保持）；回差状态机仍单线程串行（唯一消费者=评估线程，
+# 内联回退时=唯一 worker），D-07-1 单副本进程内状态语义不变；评估幂等由 uk_rule_reading /
+# uk_advice_dedup 兜底（旁路晚到/整批重试不重复告警与建议）。
 
-def flush(batch: list[tuple], engine, registry: SensorRegistry, latest: LatestCache,
-          params: dict) -> dict:
-    """一批读数落库与评估。batch 元素 = (device_code, metric, value, recorded_at aware)。
+class BatchQueue:
+    """有界批次队列（刷写 worker → 评估线程的移交通道，R-01 评估旁路）。
+
+    满时丢最旧批次放新批（评估为旁路best-effort，不反压刷写热路径；被丢批次已落库，仅
+    规则/决策评估丢失，丢量按读数条数计入 hsf_iot_eval_queue_dropped_total）；评估失败
+    put_front 回队首重试（EVAL_FAILED 计数）——毒批次仅阻塞评估线程自身重试（与原内联
+    失败整批回队语义一致，幂等键兜底），不阻塞刷写热路径；put_front 不受 maxsize 约束
+    （重试优先），持续失败经 EVAL_FAILED/EVAL_PENDING 指标可观测。"""
+
+    def __init__(self, maxsize: int = 64):
+        self._items: collections.deque = collections.deque()
+        self._maxsize = max(1, int(maxsize))
+        self._lock = threading.Lock()
+        self._event = threading.Event()                # 有数据/需唤醒信号
+
+    def put(self, batch) -> int:
+        """入队一批；若挤掉最旧批次，返回被丢读数条数（0=未丢）。"""
+        dropped = 0
+        with self._lock:
+            if len(self._items) >= self._maxsize:
+                dropped = len(self._items.popleft())
+            self._items.append(batch)
+            metrics.EVAL_PENDING.set(len(self._items))
+        self._event.set()
+        if dropped:
+            metrics.EVAL_DROPPED.inc(dropped)
+        return dropped
+
+    def put_front(self, batch) -> None:
+        """评估失败整批回队首（重试优先于新批）。"""
+        with self._lock:
+            self._items.appendleft(batch)
+            metrics.EVAL_PENDING.set(len(self._items))
+        self._event.set()
+
+    def get(self, timeout: float):
+        """阻塞取一批；超时/无数据返回 None。"""
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            self._event.wait(remaining if remaining > 0 else 0.05)
+            with self._lock:
+                if self._items:
+                    batch = self._items.popleft()
+                    metrics.EVAL_PENDING.set(len(self._items))
+                    if not self._items:
+                        self._event.clear()
+                    return batch
+                if time.monotonic() >= deadline:
+                    self._event.clear()
+                    return None
+
+    def depth(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+
+def flush_write(batch: list[tuple], latest: LatestCache) -> dict:
+    """刷写热路径（R-01 分层，docs/07 §4.1 步骤①②③）：时序批量写 + latest 缓存 +
+    sensor.last_* 冗余更新。batch 元素 = (device_code, metric, value, recorded_at aware)。
 
     单批 execute_values + ON CONFLICT DO NOTHING（docs/07 §3.2，QoS1 幂等 D-07-3）；
-    刷后四步按 §4.1 顺序执行。"""
+    异常向上抛由调用方整批回队重试（幂等键保证重试不重复落库）。
+    已知瞬态：多 worker 并发下 sensor.last_* UPDATE 间可能出现 ≤1 个刷写周期的旧值覆盖
+    （心跳 2s 后自愈）；latest 缓存已由时间戳守卫防护（/sensor/latest 主口径不受影响）。"""
     written = skipped = 0
     if batch:
         rows = [(d, m, float(v), ts) for (d, m, v, ts) in batch]
@@ -373,7 +458,7 @@ def flush(batch: list[tuple], engine, registry: SensorRegistry, latest: LatestCa
             "INSERT INTO hsf_ts.sensor_reading(device_code, metric, value, recorded_at) "
             "VALUES %s ON CONFLICT (device_code, metric, recorded_at) DO NOTHING", rows)
         skipped = len(rows) - written
-        for d, m, v, ts in batch:                      # (a) latest 进程内缓存
+        for d, m, v, ts in batch:                      # (a) latest 进程内缓存（A-07-3）
             latest.put(d, m, v, ts)
         last: dict[str, tuple] = {}                    # (b) sensor.last_* 读优化冗余（仅 iot 写）
         for d, m, v, ts in batch:
@@ -382,8 +467,13 @@ def flush(batch: list[tuple], engine, registry: SensorRegistry, latest: LatestCa
             "UPDATE hsf_biz.sensor SET `last_value`=%s, `last_recorded_at`=%s, updated_at=NOW() "
             "WHERE sensor_code=%s",
             [(v, _naive(ts), d) for d, (v, ts) in last.items()])
+    return {"received": len(batch), "written": written, "skipped": skipped}
 
-    alerts_new = 0                                     # (c) 规则引擎（回差状态机）
+
+def evaluate(batch: list[tuple], engine, registry: SensorRegistry, params: dict) -> dict:
+    """评估旁路（R-01 分层，docs/07 §4.1 步骤④）：回差状态机 → 告警落库 + 灌溉决策/自动
+    闭环。唯一调用线程=评估线程（engine 进程内状态非线程安全——D-07-1 串行语义由单消费者
+    保持；内联回退路径=唯一 worker）。"""
     alert_rows: list[tuple] = []
     rule_codes: list[str] = []
     for d, m, v, ts in batch:
@@ -393,9 +483,9 @@ def flush(batch: list[tuple], engine, registry: SensorRegistry, latest: LatestCa
             alert_rows.append((d, r["rule_code"], m, v, _naive(ts),
                                dev["village_code"], dev["parcel_code"]) if dev
                               else (d, r["rule_code"], m, v, _naive(ts), "", None))
-    alerts_new = insert_alerts(alert_rows, registry)   # 幂等键兜底：刷写失败重试不重复告警
+    alerts_new = insert_alerts(alert_rows, registry)   # 幂等键兜底：旁路晚到/重试不重复告警
 
-    advices_new = closed = 0                           # (d) 灌溉决策（仅 soil_moisture）
+    advices_new = closed = 0                           # 灌溉决策（仅 soil_moisture）
     for d, m, v, ts in batch:
         if m != "soil_moisture":
             continue
@@ -410,45 +500,104 @@ def flush(batch: list[tuple], engine, registry: SensorRegistry, latest: LatestCa
                 advices_new += 1
         elif decision.should_auto_close(v, params):
             closed += auto_close_advices(parcel)
-    return {"received": len(batch), "written": written, "skipped": skipped,
-            "alerts": alerts_new, "advices": advices_new, "closed": closed,
+    return {"alerts": alerts_new, "advices": advices_new, "closed": closed,
             "rule_codes": rule_codes}
 
 
+def flush(batch: list[tuple], engine, registry: SensorRegistry, latest: LatestCache,
+          params: dict) -> dict:
+    """一批读数落库与评估（EVAL_INLINE=1 回退路径与既有单测入口：flush_write+evaluate
+    组合，返回键集与 R-01 分层前完全一致）。"""
+    summary = dict(flush_write(batch, latest))
+    summary.update(evaluate(batch, engine, registry, params))
+    return summary
+
+
+# 台账周期刷新单一触发（R-01：多 worker 共享判重，避免 N 倍 DB 查询；语义同原单线程循环）
+_registry_refresh_lock = threading.Lock()
+_registry_refresh_last = 0.0
+
+
+def _periodic_registry_refresh(registry: SensorRegistry) -> None:
+    global _registry_refresh_last
+    now = time.monotonic()
+    with _registry_refresh_lock:
+        if now - _registry_refresh_last < REGISTRY_REFRESH:
+            return
+        _registry_refresh_last = now
+    try:
+        registry.refresh()                 # 新设备/面积变更 ≤60s 内接入
+    except Exception:
+        pass                               # 刷新失败沿用当前镜像，下轮重试
+
+
 def flusher_loop(buffer, engine, registry: SensorRegistry, latest: LatestCache, params: dict,
-                 stop_event: threading.Event, on_flush_error=None) -> None:
-    """刷写线程体：500 条或 2s 先到者刷（轮询 0.2s 粒度）；失败整批回队重试（幂等兜底）；
-    台账/面积镜像随周期刷新（60s）。"""
+                 stop_event: threading.Event, on_flush_error=None,
+                 eval_queue: BatchQueue | None = None) -> None:
+    """刷写 worker 线程体（R-01：N 个 worker 消费同一缓冲，swap 原子性天然分批）：
+    500 条或 2s 先到者刷（冻结节奏不变，轮询 0.2s 粒度）；失败整批回队重试（幂等兜底）；
+    台账/面积镜像随周期刷新（60s，多 worker 单一触发）。
+
+    评估旁路：eval_queue 非 None → swap 原子区内即移交评估队列（swap 顺序=入队顺序=到达
+    顺序，保回差状态机逐设备时序；写库失败重试批次重复评估由幂等键去重）；None → 本线程
+    内联评估（EVAL_INLINE=1 回退路径，main 侧强制单 worker）。"""
     last_flush = time.monotonic()
-    last_registry = time.monotonic()
     while not stop_event.is_set():
         stop_event.wait(0.2)
         now = time.monotonic()
-        if now - last_registry >= REGISTRY_REFRESH:
-            last_registry = now
-            try:
-                registry.refresh()         # 新设备/面积变更 ≤60s 内接入
-            except Exception:
-                pass                       # 刷新失败沿用当前镜像，下轮重试
+        _periodic_registry_refresh(registry)
         batch: list[tuple] = []
         if len(buffer) >= BATCH_MAX or (len(buffer) > 0 and now - last_flush >= FLUSH_INTERVAL):
-            batch = buffer.swap()
+            if eval_queue is not None:
+                batch = buffer.swap(on_take=eval_queue.put)     # 移交在 swap 锁内完成（保序）
+            else:
+                batch = buffer.swap()
         if not batch:
             continue
         try:
             with metrics.FLUSH_SECONDS.time():
-                summary = flush(batch, engine, registry, latest, params)
+                summary = flush_write(batch, latest)
             metrics.READINGS_WRITTEN.inc(summary["written"])
             metrics.ONCONFLICT_SKIPPED.inc(summary["skipped"])
+        except Exception as e:
+            if on_flush_error:
+                on_flush_error(e, len(batch))
+            buffer.put_front(batch[:BUFFER_PUT_FRONT_MAX])
+            last_flush = time.monotonic()
+            continue
+        if eval_queue is None:
+            try:
+                summary = evaluate(batch, engine, registry, params)
+                for rc in summary["rule_codes"]:
+                    metrics.RULE_TRIPPED.labels(rc).inc()
+                if summary["advices"]:
+                    metrics.ADVICE_CREATED.inc(summary["advices"])
+            except Exception as e:
+                if on_flush_error:
+                    on_flush_error(e, len(batch))
+        last_flush = time.monotonic()
+
+
+def evaluator_loop(eval_queue: BatchQueue, engine, registry: SensorRegistry, params: dict,
+                   stop_event: threading.Event, on_eval_error=None) -> None:
+    """评估线程体（R-01 评估旁路）：独立节拍消费刷写侧移交批次，规则/决策评估不阻塞写库；
+    异常整批回队首重试（EVAL_FAILED 计数；队列有界自限，毒批次不会无界积压）。"""
+    while not stop_event.is_set():
+        batch = eval_queue.get(0.5)
+        if batch is None:
+            continue
+        try:
+            with metrics.EVAL_SECONDS.time():
+                summary = evaluate(batch, engine, registry, params)
             for rc in summary["rule_codes"]:
                 metrics.RULE_TRIPPED.labels(rc).inc()
             if summary["advices"]:
                 metrics.ADVICE_CREATED.inc(summary["advices"])
         except Exception as e:
-            if on_flush_error:
-                on_flush_error(e, len(batch))
-            buffer.put_front(batch[:BUFFER_PUT_FRONT_MAX])
-        last_flush = time.monotonic()
+            metrics.EVAL_FAILED.inc()
+            if on_eval_error:
+                on_eval_error(e, len(batch))
+            eval_queue.put_front(batch)
 
 
 # ── 数据范围（05 §2.4 矩阵 + docs/07 §4.5 notify 读取模型；role 取自 JWT）──────────
@@ -531,6 +680,11 @@ def register_device(device_code: str, metric: str, village_code: str,
     幂等：sensor_code 或 device_cred.device_code 已存在 → 返回 None（凭证不重复下发）。
     明文凭证仅在响应中出现一次；库内只存 SM3 摘要（secret_hash）与 sha256 前 8 位提示
     （secret_hint，docs/08 §4"不落明文"口径）。
+    凭证盐（R-18，docs/24 §4；审核缺口#8）：`secrets.token_hex(16)` CSPRNG——原实现
+    `salt=now().strftime(时间戳)` 使凭证=SM3(deviceCode:时间戳)[:16]，知道设备码与注册时刻的
+    攻击者可在微秒窗口离线枚举重构（非 CSPRNG）；改随机盐后凭证不可离线预测。存储侧不变
+    （SM3 摘要+sha256 前 8 位 hint）；存量迁移无需（dep-device.sh 未对任何设备执行过，
+    docs/23 §7.5，无存量设备凭证）。
     broker 侧 passwd 追加=运行时后补项（scripts/dep-device.sh 已按 docs/08 §4 规格①交付，
     实机执行与规格③连接验证=上线前动作清单 §6——后补前已注册设备无法通过 broker 认证）。"""
     exists = db.query("SELECT sensor_code FROM hsf_biz.sensor WHERE sensor_code=%s",
@@ -539,7 +693,7 @@ def register_device(device_code: str, metric: str, village_code: str,
                            (device_code,), one=True)
     if exists or cred_exists:
         return None
-    salt = dt.datetime.now().strftime("%Y%m%d%H%M%S%f")
+    salt = secrets.token_hex(16)                    # R-18：CSPRNG 随机盐（32 hex 字符）
     secret = sm3(f"{device_code}:{salt}".encode())[:16]
     db.execute(
         "INSERT INTO hsf_biz.sensor(sensor_code,metric,village_code,parcel_code,status) "

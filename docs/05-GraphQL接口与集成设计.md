@@ -18,7 +18,7 @@
 | D-05-5 | 决议 | `@key` 实体仅 4 个：`Party(id)`/`LandParcel(code)`/`FarmProject(code)`/`Facility(code)`；Workorder/Alert 等无跨子图引用诉求，不做实体；**`Organization` 为普通类型（非 @key 实体）**——无任何跨子图引用方，§1.2/§3.1 已同步（评审 R12） | `CONVENTIONS.md` §1 强制同名实体清单；无引用不做实体，减少组合复杂度 |
 | D-05-6 | 决议 | 时间字段 SDL 类型为 `String`，格式 **ISO8601 +08:00**（如 `2026-11-07T15:04:05+08:00`） | DV-IAS 已验证实现即 String（`governance/app/schema.py:29`）；自定义 Scalar 一期无增益 |
 | D-05-7 | 决议 | 一期**无 Subscription**；实时性靠轮询（大屏 5s，`docs/06` §8 模式） | 一期无推送通道需求（无 MQ）；WebSocket 列二期 |
-| D-05-8 | 决议 | 网关**不做查询深度限制/APQ**（DV-IAS docs/06 §1 承诺项的裁剪）：内网受控 + JWT + 限流 + 鉴权已覆盖一期威胁模型 | DV-IAS 实际网关未实现深度限制（`gateway.js` 注释），避免承诺未实现能力；列为二期加固 |
+| D-05-8 | 决议 | 网关**不做查询深度限制/APQ**（DV-IAS docs/06 §1 承诺项的裁剪）：内网受控 + JWT + 限流 + 鉴权已覆盖一期威胁模型 **【部分推翻——2026-11-14 R-26/ADR-HSF-026：深度限制已实施（gw express 层护栏，`QUERY_DEPTH_MAX` 默认 10/`QUERY_FIELD_COUNT_MAX` 默认 300/`QUERY_GUARD=off` 回退开关，新错误码 `QUERY_TOO_DEEP` 400），APQ 仍不做；推翻理由与阈值依据见 ADR-HSF-026】** | DV-IAS 实际网关未实现深度限制（`gateway.js` 注释），避免承诺未实现能力；列为二期加固 |
 | A-05-1 | 假设 | 分页 `total` 一律返回真实 COUNT（不沿用 DV-IAS `total=-1` 简化） | 一期量级下 COUNT 可忽略；前端直接渲染总数 |
 | A-05-2 | 假设 | 告警状态推进接口 `POST /sim/alerts/{id}/transition` 冻结为二期（P2）；一期验收最低口径=查询+统计（FR-504 原文允许） | `hsf/docs/01` FR-504"最低验收口径：可查询、可统计" |
 
@@ -30,7 +30,7 @@
 
 ```
 管理端(Web:31210)  一张图大屏(Web)  移动端H5(Web)  k6/Locust/E2E
-        │ HTTPS/HTTP（NodePort 30090）
+        │ HTTPS/HTTP（NodePort 30099）
         ▼
 Apollo Gateway（gw：8090 业务 /graphql + 9090 /healthz 探针）
   JWT(HS256) 校验 · 令牌桶限流 RATE_CAP=6000/min · 身份头注入
@@ -70,12 +70,13 @@ Apollo Gateway（gw：8090 业务 /graphql + 9090 /healthz 探针）
 | 项 | 冻结值 | 依据 |
 |---|---|---|
 | 端口 | 业务 8090（/graphql）、探针 9090（/healthz，进程存活即 200）；容器同时声明 8090+9090 | `CONVENTIONS.md` §2.5 |
-| NodePort | 30090（上线前 `ss -tln` 核验） | `hsf/docs/00` C6 |
-| JWT | HS256 共享密钥（Secret `hsf-secrets` 的 `JWT_SECRET`，与子图 `issue_token` 同源）；`sub` 强制字符串（PyJWT≥2.10） | `CONVENTIONS.md` §2.1/§2.7 |
+| NodePort | 30099（上线前 `ss -tln` 核验） | `hsf/docs/00` C6 |
+| JWT | HS256 共享密钥（Secret `hsf-secrets` 的 `JWT_SECRET`，与子图 `issue_token` 同源）；`sub` 强制字符串（PyJWT≥2.10）。**R-31 增补（ADR-HSF-027，2026-11-14）**：`JWT_ALG` env/Secret 键支持 RS256 非对称签名演进——iam 私钥签发（kid 头）+gw/REST 公钥验签，HS256 为默认冻结兼容开关；RS256 模式伪造 HS256 共享密钥令牌被 algorithms 白名单拒绝 | `CONVENTIONS.md` §2.1/§2.7、docs/24 §4 R-31 |
 | 身份头 | 校验通过后注入 `x-user-id` / `x-user-roles` / `x-user-name`（**Base64 编码**，HTTP 头仅允许 ByteString）；未登录清空头；子图 b64decode 失败按明文回退 | `CONVENTIONS.md` §2.7 |
 | 限流 | 令牌桶 `RATE_CAP=6000/min`（env 可调），按 `user.sub` 或 `ip` 分桶；超限 **HTTP 429** + `RATE_LIMITED` | `CONVENTIONS.md` §2.6 |
 | 错误脱敏 | `extensions.code` 以 `INTERNAL` 开头 → 替换为 `{"message":"服务内部错误，请稍后重试","extensions":{"code":"UNAVAILABLE"}}` | `CONVENTIONS.md` §2.6 |
 | 内省 | `INTROSPECTION` env 控制（dev 开/生产关） | DV-IAS gateway.js 同参 |
+| 查询护栏 | `QUERY_GUARD=on`（默认开）/`off` 回退开关；`QUERY_DEPTH_MAX` 默认 10（20 层恶意深查询必拒）、`QUERY_FIELD_COUNT_MAX` 默认 300；违规 → HTTP 400 + `errors[0].extensions.code=QUERY_TOO_DEEP`。**R-26（2026-11-14，ADR-HSF-026）推翻 D-05-8"一期不做"**，manifest 注入口径见 20-services.yaml | docs/24 §4 R-26、对标③ |
 | SUBGRAPHS env | `iam=http://iam-svc.hsf-prod.svc.cluster.local:8091/graphql,land=http://land-svc.hsf-prod.svc.cluster.local:8092/graphql,project=http://project-svc.hsf-prod.svc.cluster.local:8093/graphql,facility=http://facility-svc.hsf-prod.svc.cluster.local:8094/graphql` | §1.1 |
 | 伪造头 | 客户端伪造的 `x-user-*` 在网关 `willSendRequest` 中被覆盖/剥离，子图只信任网关注入 | DV-IAS gateway.js 同法（FR-703 验收） |
 
@@ -560,7 +561,7 @@ type Mutation {
 
 ## 7. sim 服务（REST，:8095，NodePort 31211）
 
-> **非 GraphQL**（D-05-3）：IoT 时序写入与告警为机器/脚本流量（tick 定时、k6 压测直打），REST 更直接；不进联邦组合，避免大 payload 拖累网关。鉴权复用同一 JWT（`Authorization: Bearer`），错误码复用 §2.1（HTTP 映射列生效）。**限流仅网关通道**（RATE_CAP=6000/min，FR-705/E2E 用例 12 走 30090）：sim 直连端点（31211）一期不做端点级限流——机器流量直打为压测前提（ADR-HSF-003 R3），如需限流列二期（评审 R10：删除端点 1 的 429 承诺）。
+> **非 GraphQL**（D-05-3）：IoT 时序写入与告警为机器/脚本流量（tick 定时、k6 压测直打），REST 更直接；不进联邦组合，避免大 payload 拖累网关。鉴权复用同一 JWT（`Authorization: Bearer`），错误码复用 §2.1（HTTP 映射列生效）。**限流仅网关通道**（RATE_CAP=6000/min，FR-705/E2E 用例 12 走 30099）：sim 直连端点（31211）一期不做端点级限流——机器流量直打为压测前提（ADR-HSF-003 R3），如需限流列二期（评审 R10：删除端点 1 的 429 承诺）。
 
 ### 7.1 端点契约（冻结）
 
@@ -625,7 +626,7 @@ MCP 工具层、A2A、消息推送、WebSocket/SSE、APQ、外部系统 ACL（�
 
 | # | 验收项 | 验证方法（验收环境执行） | 对应 |
 |---|---|---|---|
-| V-16 | 四子图 SDL 组合成功 | `curl http://10.167.2.175:30090/ -X POST -H 'Content-Type: application/json' -d '{"query":"{ __typename }"}'` → 200 且网关日志无组合错误；各子图 `_entities` 含 §1.3 全部 @key | §1 |
+| V-16 | 四子图 SDL 组合成功 | `curl http://10.167.2.175:30099/ -X POST -H 'Content-Type: application/json' -d '{"query":"{ __typename }"}'` → 200 且网关日志无组合错误；各子图 `_entities` 含 §1.3 全部 @key | §1 |
 | V-17 | 联邦跨域（holder） | `{"query":"{ landParcel(code:\"L5306000001\"){ code holder { name } } }"}` → holder.name=种子权属人 | §1.3/FR-104 |
 | V-18 | 联邦跨域（supervisor+parcels） | `{ farmProject(code:"P5306000001"){ supervisor { name } parcels { code } } }` → 真实种子数据 | FR-304/301 |
 | V-19 | 联邦跨域（parcel） | `{ facility(code:"F5306000001"){ parcel { code } } }` | FR-401② |

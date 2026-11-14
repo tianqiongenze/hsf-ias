@@ -2,10 +2,13 @@
 # -*- coding: utf-8 -*-
 """合成样本栅格生成器（docs/08 §2.5 冻结交付物；V-2 确定性可复现）。
 
-64×64 栅格、4 个地块像元区（对应种子 L5306000001~0004 质心邻域）、NDVI 梯度分布
-覆盖 §2.3 四级阈值（0.72 旺长 / 0.50 正常 / 0.30 偏弱 / 0.12 长势差）。
+64×64 栅格、6 个地块像元区（**R-15 重标定 2026-11-14**：land_parcel 实际地块集
+L5306000001/0002/0003/0005/0006/0007——集群实测漂移，docs/23 §5.1；bbox 换算与标定记录
+见 app/sample.py 模块 docstring 与 docs/22）、NDVI 梯度分布覆盖 §2.3 四级阈值
+（0.72 旺长 / 0.50 正常 / 0.30 偏弱 / 0.12 长势差）。
 生成逻辑唯一实现点为 services/rs/app/sample.py（_bands：red=base+噪声，
-nir 由 NDVI 定义反解，random.Random(20261108) 确定性种子）——本脚本复用之并落 JSON，
+nir 由 NDVI 定义反解，random.Random(20261108) 确定性种子；SCENE_PLANS 同为 app.sample
+唯一实现，本脚本仅导入再导出）——本脚本复用之并落 JSON，
 供 seed_rs.py 经 POST /scenes 登记或离线检查样本分布。
 
 用法（在仓库根或本目录）：
@@ -23,16 +26,8 @@ for _p in (os.path.join(_RS),                               # app 包根
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from app.sample import CELL, H, PARCEL_ORDER, W, _bands, ZONES   # noqa: E402
-
-# 两景目标 NDVI（与 app/sample.py seed() 同一组确定性场景：第二景对 L5306000003 构造
-# 0.55→0.25——降幅 0.30>0.15 且后景 0.25<0.30，触发 RULE_NDVIFALL 非农化预警）
-SCENE_PLANS = [
-    ("RS-SAMPLE-20261009", {"L5306000001": 0.72, "L5306000002": 0.50,
-                            "L5306000003": 0.55, "L5306000004": 0.12}),
-    ("RS-SAMPLE-20261108", {"L5306000001": 0.71, "L5306000002": 0.49,
-                            "L5306000003": 0.25, "L5306000004": 0.13}),
-]
+from app.sample import (CELL, FALL_TARGET_PARCELS, H, PARCEL_ORDER,          # noqa: E402,F401
+                        SCENE_PLANS, W, ZONES, _bands)
 
 
 def make(scene_ndvi: dict[str, float]) -> dict:
@@ -45,7 +40,9 @@ def make(scene_ndvi: dict[str, float]) -> dict:
 def main(argv: list[str]) -> int:
     out = {"meta": {"size": [W, H], "cellSizeM": CELL, "zones": ZONES,
                     "parcelOrder": PARCEL_ORDER,
-                    "note": "NDVI 梯度覆盖 §2.3 四级阈值；第二景对 L5306000003 构造非农化预警降幅"},
+                    "fallTargets": list(FALL_TARGET_PARCELS),
+                    "note": "R-15 重标定：NDVI 梯度覆盖 §2.3 四级阈值；第二景对 L5306000003/"
+                            "L5306000005 双地块构造非农化预警降幅（R-13 多地块场景）"},
            "scenes": [{"sceneCode": code, "targetNdvi": ndvi_map, "payload": make(ndvi_map)}
                       for code, ndvi_map in SCENE_PLANS]}
     text = json.dumps(out, ensure_ascii=False)

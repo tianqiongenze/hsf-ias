@@ -6,6 +6,9 @@
 #     hsf-redis-1.hsf-redis-h.infra.svc.cluster.local:6379 \
 #     hsf-redis-2.hsf-redis-h.infra.svc.cluster.local:6379 --cluster-yes
 ---
+# R-07（2026-11-14）真值出库：REDIS_PASS 不入 manifest，部署期 scripts/gen-secrets.sh 覆盖
+# （部署顺序：00-base → 10-redis → gen-secrets.sh → 20-services；占位符为空——redis 容器
+#   requirepass 取自本 Secret，空值时 redis-server 启动会失败，属预期 fail-closed 哨兵）
 apiVersion: v1
 kind: Secret
 metadata:
@@ -13,7 +16,7 @@ metadata:
   namespace: infra
 type: Opaque
 stringData:
-  REDIS_PASS: HsfRedis-2026-tR5yJ2hL8wPa
+  REDIS_PASS: ""
 ---
 apiVersion: v1
 kind: Service

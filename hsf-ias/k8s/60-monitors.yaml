@@ -1,6 +1,10 @@
 # HSF 监控接入：ServiceMonitor（Prometheus 抓取各子图/sim/web 的 /metrics）
 # label 需与 kube-prometheus-stack 的 serviceMonitorSelector 匹配（CONVENTIONS §2.16）
 # selector 只匹配带 metrics:"true" 的 Service——gw-svc 不带该 label（网关无 /metrics，CONVENTIONS §2.16 例外）
+# R-28 增量（2026-11-14，docs/24 §4 R-28）：relabelings 将 Service 的 app label 透传为指标
+# svc_app label——iot 的链路级指标（hsf_iot_*/hsf_broker_* 等）无自带 svc 维度，Grafana 按
+# svc_app="iot-svc" 过滤与 P0/P1 告警分组（70-alerts.yaml）共口径；已有 svc label 的指标不受影响
+# （honorLabels 语义：targetLabel 独立于指标自带 label，不覆盖 hsf_http_* 的 svc 维度）
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
@@ -11,4 +15,11 @@ metadata:
 spec:
   namespaceSelector: {matchNames: [hsf-prod]}
   selector: {matchLabels: {metrics: "true"}}
-  endpoints: [{port: http-metrics, path: /metrics, interval: 30s}]
+  endpoints:
+  - port: http-metrics
+    path: /metrics
+    interval: 30s
+    relabelings:
+    - sourceLabels: [__meta_kubernetes_service_label_app]
+      targetLabel: svc_app
+      replacement: "$1"

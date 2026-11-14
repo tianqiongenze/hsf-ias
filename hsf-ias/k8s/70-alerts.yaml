@@ -1,0 +1,107 @@
+# HSF 运维可观测增强（R-28，docs/24 §4 R-28；2026-11-14）：
+#   ① PrometheusRule——SLO 燃烧率 + 链路健康告警，P0/P1 分级（P0=即时页面/P1=工单跟进）
+#   ② 日志接入说明与 Promtail label 清单（见文件尾注释块——共享 loki-stack，项目侧零配置变更）
+#   ③ Prometheus retention 3d→15d 变更留档（共享栈授权依赖项，见文件尾注释块——不擅自改）
+# 指标源事实（诚实边界，rule 编写依据）：
+#   - gw 为 Node 进程无 /metrics（CONVENTIONS §2.16 例外）——gw 的 5xx/429 比例与 browse 真实 p95
+#     **不可从 Prometheus 直测**；燃烧率落在①子图 HTTP 面（hsf_http_requests_total/hsf_http_request_seconds，
+#     browse=读路径四子图代理口径）+②kube-state-metrics 部署可用性面（gw unavailable/CrashLoop）。
+#     gw 自身 5xx/429 连续观测缺口留档为演进项（gw prometheus 客户端补造或 Ingress 收口统一）。
+#   - iot /metrics 含 docs/07 §4.1 冻结指标 + R-01 有界缓冲 + R-03 broker $SYS 直读
+#     （hsf_broker_messages_dropped_total / BROKER_CLIENTS / BROKER_STORED / BROKER_HEAP）。
+#   - kube-state-metrics 指标（kube_*）由 kube-prometheus-stack 自带，无需 hsf 侧 ServiceMonitor。
+# label 需与 kube-prometheus-stack 的 ruleSelector 匹配（与 60-monitors.yaml ServiceMonitor 同 release label）
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hsf-alerts
+  namespace: hsf-prod
+  labels: {release: kube-prometheus-stack, metrics: "true"}
+spec:
+  groups:
+  # ── P0：即时页面（gw/iot 链路停摆、broker 丢数、pod 异常）──────────────────────
+  - name: hsf-p0
+    rules:
+    - alert: HsfGwUnavailable
+      annotations:
+        summary: "gw 网关可用副本为 0（业务入口中断）"
+        description: "hsf-prod gw Deployment available=0 持续 2m；对照 docs/22 §6 跨租户抢占教训，优先查 ResourceQuota/节点驱逐事件"
+      expr: kube_deployment_status_replicas_available{namespace="hsf-prod", deployment="gw"} == 0
+      for: 2m
+      labels: {severity: P0, svc: gw}
+    - alert: HsfIotFlushStall
+      annotations:
+        summary: "iot 时序刷写疑似停摆（有收数无落库）"
+        description: "5m 窗口 hsf_iot_mqtt_received_total 增长 >0 而 hsf_iot_readings_written_total 增量=0 持续 10m——TimescaleDB 刷写链路停摆（P3-4 家族症状，联动 docs/23 §4.2）"
+      expr: (increase(hsf_iot_mqtt_received_total[5m]) > 0) and (increase(hsf_iot_readings_written_total[5m]) == 0)
+      for: 10m
+      labels: {severity: P0, svc: iot}
+    - alert: HsfBrokerDropped
+      annotations:
+        summary: "mosquitto 发生消息丢弃（QoS1 补投前提被打破）"
+        description: "5m 窗口 hsf_broker_messages_dropped_total 增量 >0（R-03 $SYS 直读指标）——核对 max_queued_messages 与 iot 消费速度（docs/24 §4 R-03 再平衡）"
+      expr: increase(hsf_broker_messages_dropped_total[5m]) > 0
+      for: 5m
+      labels: {severity: P0, svc: broker}
+    - alert: HsfPodCrashLoop
+      annotations:
+        summary: "hsf-prod pod 进入 CrashLoopBackOff"
+        description: "排障循环入口：kubectl logs <pod> --previous（CONVENTIONS §3.7）；本告警覆盖全部 hsf-prod workload"
+      expr: kube_pod_container_status_waiting_reason{namespace="hsf-prod", reason=~"CrashLoopBackOff|ImagePullBackOff"} > 0
+      for: 5m
+      labels: {severity: P0, svc: k8s}
+  # ── P1：工单跟进（5xx 燃烧率多窗口、browse 读路径 p95 代理、缓冲背压、限流保护失效）──
+  - name: hsf-p1
+    rules:
+    - alert: HsfService5xxBurnRate
+      annotations:
+        summary: "子图 5xx 燃烧率超阈（多窗口 5m+1h 同时 >2%）"
+        description: "SLO 燃烧率双窗口判定（快慢窗同时超 2% 才告警，抑制抖动误报）；gw 自身 5xx 无 metrics（见文件头事实）——svc 维度取 hsf_http_requests_total（iam/land/project/facility/sim/rs/uplink/ratelimit/iot）"
+      expr: |
+        (sum by (svc) (rate(hsf_http_requests_total{code=~"5.."}[5m]))
+         / sum by (svc) (rate(hsf_http_requests_total[5m])) > 0.02)
+        and
+        (sum by (svc) (rate(hsf_http_requests_total{code=~"5.."}[1h]))
+         / sum by (svc) (rate(hsf_http_requests_total[1h])) > 0.02)
+      for: 5m
+      labels: {severity: P1, family: slo-burn}
+    - alert: HsfBrowsePathP95
+      annotations:
+        summary: "browse 读路径子图 p95 > 500ms（SLO 代理口径）"
+        description: "browse 真实 p95 由 k6 browse 场景记录在案（CONVENTIONS §4）；本规则为读路径四子图 HTTP p95 的连续观测代理（gw 无 /metrics，文件头诚实边界）——路径过滤业务端点（排除探针/指标路径）"
+      expr: |
+        histogram_quantile(0.95,
+          sum by (svc, le) (rate(hsf_http_request_seconds_bucket{svc=~"land|project|facility|iam", path!~"/(metrics|healthz|readyz).*"}[5m]))) > 0.5
+      for: 10m
+      labels: {severity: P1, family: slo-latency}
+    - alert: HsfIotBufferBacklog
+      annotations:
+        summary: "iot 读数缓冲积压（背压预警）"
+        description: "hsf_iot_buffer_size > 20000（R-01 有界缓冲上限 50000 的 40%）——flush 吞吐跟不上收数，先于 HsfIotFlushStall 的预警级"
+      expr: hsf_iot_buffer_size > 20000
+      for: 5m
+      labels: {severity: P1, svc: iot}
+    - alert: HsfRatelimitUnavailable
+      annotations:
+        summary: "ratelimit-svc 可用副本为 0（gw fail-open 静默放行）"
+        description: "gw 限流判定不可用时 fail-open 放行+节流告警日志（docs/07 §5.2 冻结语义）——本规则把'保护失效'升为可观测告警；恢复前容量模型按无限流理解"
+      expr: kube_deployment_status_replicas_available{namespace="hsf-prod", deployment="ratelimit-svc"} == 0
+      for: 2m
+      labels: {severity: P1, svc: ratelimit}
+---
+# ══ ② 日志接入说明（R-28 实施路径②——共享 loki-stack 在运行，项目侧零配置变更）═══
+# Promtail（kube-prometheus-stack 配套）按 pod 标签自动发现并携带以下 label——Grafana LogQL 直接过滤：
+#   {namespace="hsf-prod", app="gw"}     网关日志（限流 fail-open 节流告警/QUERY_TOO_DEEP 拒绝）
+#   {namespace="hsf-prod", app="iot-svc"} iot 日志（flush/规则/凭证）
+#   {namespace="hsf-prod", app="sim-svc"} sim 日志（MQTT 发布 rc）
+# label 来源：20-services.yaml 各 Deployment pod metadata.labels.app（已全量在位，无需新增）
+# ——项目侧无 Promtail 配置变更权（共享栈），本清单为 Grafana 检索口径留档；验证命令：
+#   LogQL: {namespace="hsf-prod", app="gw"} |= "fail-open"（应在 gw 限流故障演练时命中）
+# ══ ③ Prometheus retention 变更留档（R-28 实施路径③——授权依赖项，与 R-23 同通道）═══
+# 现状：共享 Prometheus（kube-prometheus-stack）retention=3d——月度 SLO/燃烧率趋势无法评估。
+# 建议：retention 3d→15d（或远程写至长周期存储）。变更影响共享租户，须集群负责人授权后执行：
+#   kubectl -n monitoring patch prometheus <name> --type merge -p \
+#     '{"spec":{"retention":"15d"}}'   # 具体资源名/参数以 monitoring ns 实际 CR 为准
+# 风险：TSDB 磁盘增量 ×5（现有 3d 基线 ×5 估算后再申请授权）；本文件不擅自变更，仅留档口径。
+# 授权未获期间：燃烧率告警（5m/1h 双窗）在 3d retention 下功能完整，仅月度趋势评估不可用（诚实声明）。

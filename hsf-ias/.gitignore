@@ -1,0 +1,5 @@
+# R-07（2026-11-14）：部署机真值产物不入 git——scripts/gen-secrets.sh 生成/维护
+k8s/gen/
+__pycache__/
+*.pyc
+node_modules/

@@ -258,6 +258,12 @@ def _apply(info, code: str, action: str, note: str | None = None) -> FarmProject
 
 
 # 显式 types 列表：未注册实体不进 SDL，网关组合直接 400（CONVENTIONS §2.4）
-schema = strawberry.federation.Schema(query=Query, mutation=Mutation,
-                                      types=[FarmProject, Party, LandParcel],
-                                      enable_federation_2=True)
+# enable_federation_2=True 版本自适应（同 iam/app/schema.py 注记：钉版 0.254.1 走显式参数，
+# strawberry-graphql≥0.26 参数移除走默认 F2，形态契约不变）
+try:
+    schema = strawberry.federation.Schema(query=Query, mutation=Mutation,
+                                          types=[FarmProject, Party, LandParcel],
+                                          enable_federation_2=True)
+except TypeError:  # pragma: no cover —— strawberry-graphql≥0.26：参数移除，F2 默认启用
+    schema = strawberry.federation.Schema(query=Query, mutation=Mutation,
+                                          types=[FarmProject, Party, LandParcel])

@@ -1,0 +1,60 @@
+# HSF K8s 生产化①（R-21，docs/24 §4 R-21）：PodDisruptionBudget——2 副本服务 minAvailable=1
+# 依据：docs/24 §4 R-21 实施路径①（ask 口径：gw/iam/land/project/facility/ratelimit/web 七项
+#   minAvailable 1——与 20-services.yaml 各 replicas:2 一一对应，七项全部 ≥2 副本可满足）；
+#   对标④（共享集群 hsf 域 PDB=0 实测、邻项目 19 条 PDB 先例）；docs/22 §6 跨租户抢占教训
+#   （voluntary eviction 面的最低可用性承诺，PriorityClass 只管抢占不管 drain）。
+# 单副本不设 PDB（sim/iot/rs/uplink/hsf-timescale/hsf-mosquitto）：minAvailable=1 会阻塞
+#   一切 voluntary disruption、maxUnavailable=0 同效——单副本无可用性承诺可让渡，理由留档
+#   （docs/24 §4 R-21 实施路径①括注口径）。
+# hsf-dev 同构口径：dev 为副本减半派生（gw/iam/land/project/facility/web=1 副本）——dev 派生
+#   清单 apply 前必须把对应 PDB 的 minAvailable 降为 0 或整体不 apply，否则 1 副本服务将被
+#   PDB 完全锁死（本文件只冻结 prod）。
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: gw-pdb, namespace: hsf-prod, labels: {app: gw}}
+spec:
+  minAvailable: 1
+  selector: {matchLabels: {app: gw}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: iam-pdb, namespace: hsf-prod, labels: {app: iam-svc}}
+spec:
+  minAvailable: 1
+  selector: {matchLabels: {app: iam-svc}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: land-pdb, namespace: hsf-prod, labels: {app: land-svc}}
+spec:
+  minAvailable: 1
+  selector: {matchLabels: {app: land-svc}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: project-pdb, namespace: hsf-prod, labels: {app: project-svc}}
+spec:
+  minAvailable: 1
+  selector: {matchLabels: {app: project-svc}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: facility-pdb, namespace: hsf-prod, labels: {app: facility-svc}}
+spec:
+  minAvailable: 1
+  selector: {matchLabels: {app: facility-svc}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: ratelimit-pdb, namespace: hsf-prod, labels: {app: ratelimit-svc}}
+spec:
+  minAvailable: 1
+  selector: {matchLabels: {app: ratelimit-svc}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: web-pdb, namespace: hsf-prod, labels: {app: web}}
+spec:
+  minAvailable: 1
+  selector: {matchLabels: {app: web}}

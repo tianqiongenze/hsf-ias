@@ -5,7 +5,7 @@ import os
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import hashes
 
-_SM4_KEY_ENV = "SM4_FIELD_KEY"  # 32字节hex；缺省用内置MVP密钥（生产必须外置轮换）
+_SM4_KEY_ENV = "SM4_FIELD_KEY"  # 32字节hex；R-06（2026-11-14）：密钥外置+fail-closed——env 缺失即抛异常，禁止源码内置回退
 
 
 def sm3(data: bytes) -> str:
@@ -44,8 +44,18 @@ def _hmac_sm3(key: bytes, msg: bytes) -> bytes:
 
 
 def _sm4_key() -> bytes:
-    hexk = os.environ.get(_SM4_KEY_ENV, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"[:64])
-    return bytes.fromhex(hexk[:64])
+    hexk = (os.environ.get(_SM4_KEY_ENV) or "").strip().lower()
+    try:
+        key = bytes.fromhex(hexk)
+    except ValueError:
+        key = b""
+    if len(key) != 32:
+        raise RuntimeError(
+            f"env {_SM4_KEY_ENV} 缺失或非法（须 32 字节=64 hex 字符）——SM4 字段加密密钥必须外置"
+            "（R-06 fail-closed：源码不内置回退密钥；值由 hsf-secrets/SM4_FIELD_KEY 注入，"
+            "轮换流程见 CONVENTIONS.md §2.17）"
+        )
+    return key
 
 
 def sm4_encrypt(plaintext: str) -> str:

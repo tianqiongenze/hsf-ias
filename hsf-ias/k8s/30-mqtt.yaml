@@ -1,9 +1,10 @@
 # HSF 二期 MQTT Broker：Mosquitto（StatefulSet 1 副本，命名空间 hsf-prod）
 # 依据：docs/07 §2（冻结 topic/payload/QoS/认证）、§1.3（资源核算）、CONVENTIONS-P2 T-2/T-3
 # 镜像：eclipse-mosquitto:2.1 → 本地仓库 base/mosquitto:2.1
-# 认证（docs/07 §2.4 冻结）：明文 1883（ClusterIP 不出网，A-07-1）+ 密码认证 + ACL，不做 TLS；
-#   单账号 hsf，密码=Secret hsf-secrets/MQTT_PASS，由 initContainer 以 mosquitto_passwd 写入
-#   PVC（幂等覆盖，密码不落 ConfigMap）；sim 只 pub、iot 只 sub，单一 readwrite 账号即可
+# 认证（docs/07 §2.4 冻结，ADR-HSF-018 修订 2026-11-14）：明文 1883（ClusterIP 不出网，A-07-1）+
+#   密码认证 + ACL，不做 TLS；分账号最小授权（R-20）：hsf-sim(仅 pub)/hsf-iot(仅 sub)+设备 own-topic
+#   pattern，密码=Secret hsf-secrets/MQTT_PASS_SIM/MQTT_PASS_IOT（旧单账号 hsf/MQTT_PASS 保留为
+#   回退开关），由 initContainer 以 mosquitto_passwd 写入 PVC（幂等追加，禁 -c 保护设备条目）
 # 调度：nodeSelector 固定 worker1（T-3）；hsf-dev 同构 sed 's/hsf-prod/hsf-dev/g' 另行 apply
 ---
 apiVersion: v1
@@ -21,21 +22,51 @@ data:
     acl_file /mosquitto/data/acl
     persistence true
     persistence_location /mosquitto/data/
-    max_queued_messages 10000
+    # R-03 再平衡（docs/24 §4 R-03 approach ②）：10000→100000——
+    #   ① 兜底时长：稳态 24 条/s 下 1 万条 ≈ 7 分钟（docs/07 §2.4 原核算），iot 重启窗口内
+    #     iot-write 突发（2.4 万条/迭代）+ 稳态叠加即可触顶丢 QoS1（docs/23 §4.2 对账推断
+    #     ~0.5M 条丢失的直接成因）；10 万条 ≈ 69 分钟稳态兜底，且单批突发 2.4 万条不再触顶；
+    #   ② 内存核算：队列满载 ≈10 万条 × ~1KB（payload+条目开销）≈100MB < limits 256Mi（本文件
+    #     mosquitto 容器 resources.limits，余量充足）；$SYS heap/current 已入 iot /metrics
+    #     （hsf_broker_heap_bytes）持续观测；
+    #   ③ PVC 增长：persistence 落盘为消息存储快照（autosave 缺省 1800s），10 万条 ≈ 数十 MB
+    #     << data PVC 1Gi；回退=恢复原值 10000 重启 broker 即可。
+    max_queued_messages 100000
     # W-1（docs/08 §5）：100→1000 与 sim 侧 max_inflight_messages_set(1000) 匹配——
     # iot-write 批量 tick 的 QoS1 同步发布吞吐瓶颈（2.4 万条/迭代 p95 8.29s→预期降一个量级）；
     # mosquitto 上限 65535，1000 为设备接入框架（docs/08 §4）预留的并发窗口
     max_inflight_messages 1000
+    # R-03 丢弃监控（docs/24 §4 R-03 approach ①）：$SYS 每 10s 发布一轮（缺省亦 10s，显式冻结
+    # 防上游改缺省）；采集方=iot 内置 BrokerSysMonitor（services/iot/app/sysmon.py，无新增
+    # 组件）。丢弃事件日志属 warning/error 类别（log_type 缺省已含 error/warning/notice/
+    # information，kubectl logs 可见 "Outgoing messages are being dropped for client ..."），
+    # 无独立"丢弃"log_type 类别（mosquitto.conf man page 冻结类别表），故不重复声明。
+    sys_interval 10
   acl: |
-    # sim 发布（pub）iot 订阅（sub）共用 hsf 账号；下行行 topic hsf/cmd/# 三期内不放开
-    user hsf
-    topic readwrite hsf/sensor/#
+    # R-20 最小授权改造（ADR-HSF-018，2026-11-14）：sim/iot 读写分离——原单账号 hsf
+    # readwrite 口径废止（审核缺口#9：sim 凭证泄露可订阅全量读数、iot 凭证泄露可伪造写）。
+    # user hsf-sim：sim 发布者仅写 hsf/sensor/#
+    user hsf-sim
+    topic write hsf/sensor/#
+    # user hsf-iot：iot 订阅者仅读 hsf/sensor/#；下行 topic hsf/cmd/# 三期内不放开（§2.1 冻结）
+    user hsf-iot
+    topic read hsf/sensor/#
+    # R-03：$SYS 只读授权（iot BrokerSysMonitor 采集丢弃/存储/连接/堆内存四 buckets）——
+    # 2026-11-14 实测：无此行时账号订阅 $SYS/broker/# 收不到任何消息（授权缺口即 R-03
+    # 现状证据）；$SYS 写权限 broker 恒拒绝，此处仅 read 最小授权
+    topic read $SYS/broker/#
+    # 旧单账号 hsf（MQTT_PASS）保留在 passwd 仅作回退开关：无 user 段即无 sensor 授权
+    # （mosquitto ACL 未匹配 topic/pattern 行一律拒绝；pattern 退化前缀见下注）。
+    # 回退=恢复一行 "user hsf / topic readwrite hsf/sensor/#" 并重启 broker（ADR-HSF-018 影响⑤）。
     # 设备接入框架（docs/08 §4，CONVENTIONS-P3）：真实设备以 deviceCode 作为 MQTT username 登录，
     # pattern 行保证每设备仅能读写自身 topic（%u=username 展开）；注意 pattern 仅是授权语义——
     # 生效前提是 password_file 存在对应设备账号：凭证经 POST /devices/register 下发（明文仅响应一次，
     # 库内只存摘要），passwd 追加=运行时后补项（规格冻结于 docs/08 §4"broker 凭证现状与后补规格"：
     # scripts/dep-device.sh 用注册响应凭证明文 mosquitto_passwd -b 追加禁用 -c + broker 滚动 +
-    # passwd-init 去 -c 覆盖配套改造；后补前已注册设备无法通过 broker 认证）
+    # passwd-init 去 -c 覆盖配套改造；后补前已注册设备无法通过 broker 认证）。
+    # pattern 行为全局规则（对所有账号生效）：对 hsf-sim/hsf-iot 展开后仅授权退化前缀
+    # hsf/sensor/hsf-sim/#、hsf/sensor/hsf-iot/#（无生产流量、无业务语义，不构成越权路径，
+    # ADR-HSF-018 决策①留档）
     pattern readwrite hsf/sensor/%u/#
 ---
 apiVersion: v1
@@ -60,10 +91,13 @@ spec:
       priorityClassName: hsf-normal
       nodeSelector: {kubernetes.io/hostname: k8s-worker1}   # T-3：master requests 满，只允许 worker1
       initContainers:
-      # 密码文件初始化（docs/08 §4 后补规格②，2026-11-13 评审修订落地）：
+      # 密码文件初始化（docs/08 §4 后补规格② + R-20/ADR-HSF-018 分账号增补，2026-11-14）：
       #   - passwd 文件缺失 → mosquitto_passwd -b -c 按 Secret 初始化单账号 hsf（docs/07 §2.4）；
       #   - passwd 已存在且含 hsf 账号 → **跳过 -c 重建**——否则 broker pod 每次重启都会
       #     抹掉 dep-device.sh（规格①）追加的设备条目；账号轮换走 hsf-secrets 更新+手工重建；
+      #   - R-20 分账号（ADR-HSF-018）：hsf-sim/hsf-iot 幂等追加（grep 缺失才 -b 追加，
+      #     禁 -c——与设备条目同一保护语义）；R-19 降级口径（docs/24 §6）已注册设备的
+      #     dep-device.sh 追加条目亦受本跳过语义保护；
       #   - chown 给运行时 uid 1883（mosquitto 以 root 启动后自降权到 mosquitto 用户，
       #     PVC 目录属 root 则持久化写失败）
       - name: passwd-init
@@ -77,6 +111,18 @@ spec:
           else
             mosquitto_passwd -b -c /mosquitto/data/passwd hsf "$MQTT_PASS"
           fi
+          if grep -q '^hsf-sim:' /mosquitto/data/passwd; then
+            echo "passwd-init: hsf-sim 已存在，跳过"
+          else
+            mosquitto_passwd -b /mosquitto/data/passwd hsf-sim "$MQTT_PASS_SIM"
+            echo "passwd-init: hsf-sim 已追加"
+          fi
+          if grep -q '^hsf-iot:' /mosquitto/data/passwd; then
+            echo "passwd-init: hsf-iot 已存在，跳过"
+          else
+            mosquitto_passwd -b /mosquitto/data/passwd hsf-iot "$MQTT_PASS_IOT"
+            echo "passwd-init: hsf-iot 已追加"
+          fi
           # acl 同拷入 PVC：见 mosquitto.conf 注释——2.1.2 敏感文件属主校验，ConfigMap
           # 直挂（root 属主）不可读；init 每次启动重拷，ConfigMap 变更重启 pod 即生效
           cp /mosquitto/config/acl /mosquitto/data/acl
@@ -84,6 +130,8 @@ spec:
         securityContext: {runAsUser: 0}
         env:
         - {name: MQTT_PASS, valueFrom: {secretKeyRef: {name: hsf-secrets, key: MQTT_PASS}}}
+        - {name: MQTT_PASS_SIM, valueFrom: {secretKeyRef: {name: hsf-secrets, key: MQTT_PASS_SIM}}}
+        - {name: MQTT_PASS_IOT, valueFrom: {secretKeyRef: {name: hsf-secrets, key: MQTT_PASS_IOT}}}
         volumeMounts:
         - {name: data, mountPath: /mosquitto/data}
         - {name: config, mountPath: /mosquitto/config}   # 只读源：acl 拷贝进 PVC（上）

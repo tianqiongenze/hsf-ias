@@ -1,0 +1,26 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: e2e-browser-run3
+  namespace: hsf-prod
+  labels: {app: e2e-browser}
+spec:
+  activeDeadlineSeconds: 1200
+  backoffLimit: 0
+  completions: 1
+  parallelism: 1
+  template:
+    metadata: {labels: {app: e2e-browser}}
+    spec:
+      restartPolicy: Never
+      priorityClassName: hsf-batch
+      containers:
+      - name: e2e
+        image: 10.167.2.175:30500/perf/playwright-python:1.45.0
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c", "pip install --timeout 30 -i https://pypi.tuna.tsinghua.edu.cn/simple playwright==1.45.0 >/dev/null 2>&1; PLAYWRIGHT_BROWSERS_PATH=/ms-playwright python -I /script/e2e_browser.py"]
+        resources: {requests: {cpu: 200m, memory: 256Mi}, limits: {cpu: "1", memory: 512Mi}}
+        volumeMounts: [{mountPath: /script, name: script}]
+      volumes:
+      - name: script
+        configMap: {name: e2e-browser}

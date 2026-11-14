@@ -11,6 +11,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(_here)), "common
 
 import jwt
 
+# R-07（2026-11-14）：测试侧同源 fail-closed——JWT_SECRET 必须在导入 hsf_common.web 前置于 env
+# （web.py 导入期校验非空），禁止测试代码内置回退密钥（与生产 fail-closed 口径一致）
+os.environ.setdefault("JWT_SECRET", "test-only-jwt-secret-not-for-prod-3f9k")
+_JWT_SECRET = os.environ["JWT_SECRET"]
+
+# R-06（2026-11-14）：SM4_FIELD_KEY 同口径 fail-closed（crypto.py:53 调用期校验非空+64 hex 字符）——
+# 单测需前置测试专用值（与 JWT_SECRET 同法，仅测试进程 env，不入生产面；0f*32=64 hex 非真实密钥）
+os.environ.setdefault("SM4_FIELD_KEY", "0f" * 32)
+assert len(os.environ["SM4_FIELD_KEY"]) == 64
+
 from hsf_common.crypto import mask_phone, sm3, sm3_pbkdf2, sm4_decrypt, sm4_encrypt
 from hsf_common.web import Exception429, issue_token
 
@@ -40,7 +50,6 @@ def test_sm4_roundtrip_and_mask():
 
 
 # ───────── JWT（PyJWT≥2.10：sub 必须字符串，CONVENTIONS §2.1）─────────
-_JWT_SECRET = os.environ.get("JWT_SECRET", "HsfJwt-2026-bN8wQ4vXzA6sD1fG")  # 与 gw 同源
 
 
 def test_jwt_roundtrip_int_sub_coerced_to_str():

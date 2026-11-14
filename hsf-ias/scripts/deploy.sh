@@ -11,6 +11,8 @@ kubectl apply -f k8s/10-redis.yaml
 kubectl apply -f k8s/25-timescale.yaml
 kubectl apply -f k8s/30-mqtt.yaml
 kubectl apply -f k8s/20-services.yaml
+kubectl apply -f k8s/45-pdb.yaml        # R-21：PDB（2 副本服务 minAvailable=1；dev 派生须先降 minAvailable）
+if [ -f k8s/50-backup.yaml ]; then kubectl apply -f k8s/50-backup.yaml; fi   # R-22：备份 CronJob（依赖 25-timescale 就绪）
 if [ -f k8s/60-monitors.yaml ]; then kubectl apply -f k8s/60-monitors.yaml; fi
 for d in gw iam-svc land-svc project-svc facility-svc sim-svc web ratelimit-svc iot-svc rs-svc uplink-svc; do
   kubectl -n hsf-prod rollout status deploy/$d --timeout=240s

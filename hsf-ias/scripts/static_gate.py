@@ -9,7 +9,9 @@
   5. JSONResponse+generate_latest —— §2.8 /metrics 必须 Response(generate_latest())，JSONResponse 转义引号毁 Prometheus
   6. CDN 引用         —— §0/§2.12 局域网客户端不可达 CDN，前端库文件必须进镜像
   7. federation Schema —— §2.4 四子图 schema.py 必须用 strawberry.federation.Schema 且显式 types=[...]，
-                          未注册实体不进 SDL、网关组合直接 400
+                          未注册实体不进 SDL、网关组合直接 400；
+                          R-12 增查：五子图（四子图+rs）构造必须含 enable_federation_2=True
+                          （参数逃逸盲区收口——rs 缺参曾仅靠人工发现）
 
 二期检查项（docs/07 §6.4 冻结，CONVENTIONS-P2 T-2/T-3）：
   8. ioredis          —— T-3 红线：全仓代码+package.json 禁用 ioredis（检查 require/import/依赖键
@@ -21,6 +23,13 @@
                           k8s 清单对应 workload 必含 readinessProbe+livenessProbe+resources.limits（§2.15）
  12. gw 缺 RATE_MODE/RATE_SVC —— §5.2/§5.3 gw 必含 RATE_MODE（svc 默认/local 回退开关）与 RATE_SVC
  13. E2E<17           —— §6.1 E2E 用例数 ≥17（e2e_browser.py 的 rec() 首参去重计数，try/except 同名合并）
+ 14. gw 缺查询护栏     —— R-26/ADR-HSF-026（2026-11-14）：gw 必含深度/复杂度护栏实现
+                          （QUERY_DEPTH_MAX/QUERY_FIELD_COUNT_MAX/QUERY_TOO_DEEP 符号在位；
+                          QUERY_GUARD=off 为运行时回退开关，代码必须存在——开关以代码存在为前提）
+ INFO CI 组合校验提示 —— R-26 实施路径②（docs/24 §4）：子图 SDL 变更 → gw 本地组合 → supergraph
+                          SDL 快照 diff 留档（内网无 rover，以 gw 组合输出为等价物；supergraph SDL
+                          快照建议落 docs/adr/ 或 docs/23 附录取证）；R-12 enable_federation_2 门禁项
+                          （检查项 7）已并入本清单
 
 用法：python static_gate.py [--root 仓库根]（默认脚本上级目录）
 """
@@ -136,7 +145,10 @@ def check_file(path: Path, findings: list):
 
 
 def check_federation(root: Path, findings: list):
-    """§2.4：四子图必须 strawberry.federation.Schema(... types=[...])；裸 strawberry.Schema 视为未启用联邦。"""
+    """§2.4：四子图必须 strawberry.federation.Schema(... types=[...])；裸 strawberry.Schema 视为未启用联邦。
+    R-12（docs/24 §4）：构造还必须含 enable_federation_2=True（Federation 2 形态契约参数）——
+    该参数此前从 check 面逃逸（rs 子图缺参仅靠人工发现），逐子图按"构造调用内嵌参数"形态校验，
+    避免注释行出现同字样造成的假通过。"""
     for rel in SUBGRAPH_SCHEMAS:
         p = root / rel
         if not p.is_file():
@@ -146,8 +158,17 @@ def check_federation(root: Path, findings: list):
         flat = re.sub(r"\s+", "", text)
         if "strawberry.federation.Schema(" not in flat and "strawberry.federation.Schema(" not in text:
             findings.append(("federation Schema", rel + ":0", "未使用 strawberry.federation.Schema"))
-        elif "types=[" not in flat:
+            continue
+        if "types=[" not in flat:
             findings.append(("federation Schema", rel + ":0", "Schema 未显式声明 types=[...]（未注册实体不进 SDL，网关组合 400）"))
+        # R-12：参数必须内嵌于 Schema( 构造调用（strip 空白后匹配到首个右括号），注释同字样不豁免门禁
+        ctor = []
+        for m in re.finditer(r"strawberry\.federation\.Schema\(", flat):
+            ctor.append(flat[m.end():m.end() + 200].split(")")[0])
+        if not any("enable_federation_2=True" in c for c in ctor):
+            findings.append(("federation Schema", rel + ":0",
+                             "federation Schema 构造缺 enable_federation_2=True"
+                             "（R-12：Federation 2 形态契约参数必传，CONVENTIONS.md §2.4/docs/03 §5.6/docs/05 §1.2）"))
         if re.search(r"(?<![\w.])strawberry\.Schema\(", text):
             findings.append(("federation Schema", rel + ":0", "误用非联邦 strawberry.Schema"))
 
@@ -236,6 +257,23 @@ def check_gw_rate_env(root: Path, findings: list):
         if envname not in text:
             findings.append(("gw缺RATE_MODE/RATE_SVC", "gw:0",
                              f"未含 {envname}（docs/07 §5.2/§5.3：svc 模式默认 + local 回退开关必须以代码存在为前提）"))
+
+
+def check_gw_query_guard(root: Path, findings: list):
+    """检查项 14（R-26/ADR-HSF-026）：gw 必含查询深度/复杂度护栏实现符号——
+    深度阈值/复杂度阈值/新错误码三者任一缺失即违规（D-05-8 已推翻，护栏为常驻代码面；
+    QUERY_GUARD=off 运行时开关不豁免代码存在性——与检查项 12 RATE_MODE 回退开关同纪律）。"""
+    gw = root / "gw"
+    if not gw.is_dir():
+        findings.append(("gw缺查询护栏", "gw:0", "gw 目录缺失"))
+        return
+    text = _dir_text(gw)
+    for sym, hint in (("QUERY_DEPTH_MAX", "深度阈值（默认 10，20 层恶意查询必拒）"),
+                      ("QUERY_FIELD_COUNT_MAX", "复杂度阈值（总可选字段数）"),
+                      ("QUERY_TOO_DEEP", "护栏错误码（400 + errors[0].extensions.code）"),
+                      ("queryGuardViolation", "护栏判定函数（express 层 GraphQL 解析前）")):
+        if sym not in text:
+            findings.append(("gw缺查询护栏", "gw:0", f"未含 {sym}（{hint}，R-26/ADR-HSF-026）"))
 
 
 def check_e2e_count(root: Path, findings: list):
@@ -354,12 +392,19 @@ def main():
     check_sim_rules(root, findings)
     check_p2_new_services(root, findings)
     check_gw_rate_env(root, findings)
+    check_gw_query_guard(root, findings)
     check_e2e_count(root, findings)
     check_p3_new_services(root, findings)
     check_rs_pure_cpu(root, findings)
     check_uplink_transport(root, findings)
     check_manifest_p3_tags(root, findings)
 
+    # R-26 实施路径②/验收口径"门禁输出含 supergraph diff 步骤"：CI 组合校验提示（常驻输出，
+    # 不计违规——提示项，供 CI 流水线与部署工程师按步骤执行）
+    print("INFO | CI 组合校验提示（R-26/ADR-HSF-026）: 子图 SDL 变更 → gw 本地组合 "
+          "(node gw/gateway.js 或 gw 容器) → supergraph SDL 快照 diff 留档")
+    print("INFO |   内网无 rover：以 gw 组合输出为等价物；快照建议落 docs/adr/ 或 docs/23 附录取证；")
+    print("INFO |   R-12 enable_federation_2 门禁项（检查项 7 federation Schema 三查）已并入本清单。")
     for rule, loc, snippet in findings:
         print("VIOLATION | %-24s | %s | %s" % (rule, loc, snippet))
     print("SUMMARY violations=%d files=%d root=%s" % (len(findings), n_files, root))

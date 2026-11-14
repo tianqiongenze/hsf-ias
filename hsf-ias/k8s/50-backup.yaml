@@ -1,0 +1,201 @@
+# HSF K8s 生产化②（R-22，docs/24 §4 R-22）：备份 CronJob——TimescaleDB/TiDB/Redis
+# 依据：ask 口径（TimescaleDB pg_dump 全量 05:00 每日保留 7 份 local-path PVC；TiDB/Redis 导出每周；
+#   手动触发一次验证备份产物可读）+ docs/24 §4 R-22（3-2-1 最小可行：节点本地+可恢复验证；
+#   无可写外部存储时先落节点本地目录+轮转——次优如实记录）。
+# 镜像三件（全部已在本地仓库 10.167.2.175:30500）：
+#   base/timescaledb:2.17.2-pg16（pg_dump/pg_restore 客户端，与 hsf-timescale 同镜像同版本）
+#   base/mysql:5.7（mysqldump 5.7.44——TiDB 兼容旗标实测见下；**不可用 base/mysql:8.0**：
+#     2026-11-14 实测 "Fatal glibc error: CPU does not support x86-64-v2"，集群 CPU 不支持）
+#   base/redis:8-alpine（redis-cli --rdb 导出 + redis-check-rdb 校验，hsf-redis 同源镜像）
+# mysqldump 旗标实测（2026-11-14，一次性 pod 对 tidb.infra:4000/hsf_md，RC=0）：
+#   --set-gtid-purged=OFF --skip-lock-tables --skip-add-locks——**不可加 --single-transaction**：
+#   TiDB 对 mysqldump 的 SAVEPOINT 保存点滚动报 "SAVEPOINT sp does not exist (1305)"，
+#   dump 中途失败仅 4200 字节截断产物；一致性口径=TiDB MVCC 读快照（单库量级小，可接受，
+#   BR/dumpling 属工具镜像引入需 ADR——docs/24 §4 R-22 ②原列 BR 依赖可后置）。
+# 调度：全部备份 pod nodeSelector 固定 k8s-worker1（PVC local-path 绑定首消费节点，且与
+#   hsf-timescale/hsf-mosquitto 数据卷同节点——T-3 同口径）；磁盘核算：worker1 / 余 30G，
+#   hsf_ts 现 1246MB → 7 份 -Fc 压缩 dump ≈ 5-9G，10Gi PVC 余量充足（超限由保留轮转兜底）。
+# 时区：spec.timeZone=Asia/Shanghai（kubeadm v1.28.2，CronJobTimeZone 特性 1.27 起 beta 默认开启；
+#   容器 TZ 环境变量兜底文件名时间戳口径）。
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hsf-backup
+  namespace: hsf-prod
+  labels: {app: hsf-backup}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources: {requests: {storage: 10Gi}}
+---
+# ─── TimescaleDB 全量备份：每日 05:00，pg_dump -Fc，保留 7 份 ───
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hsf-ts-backup
+  namespace: hsf-prod
+  labels: {app: hsf-backup}
+spec:
+  schedule: "0 5 * * *"
+  timeZone: Asia/Shanghai
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata: {labels: {app: hsf-backup}}
+        spec:
+          restartPolicy: Never
+          priorityClassName: hsf-batch
+          nodeSelector: {kubernetes.io/hostname: k8s-worker1}
+          containers:
+          - name: dump
+            image: 10.167.2.175:30500/base/timescaledb:2.17.2-pg16
+            imagePullPolicy: IfNotPresent
+            env:
+            - {name: PGPASSWORD, valueFrom: {secretKeyRef: {name: hsf-secrets, key: TIMESCALE_PASS}}}
+            - {name: TZ, value: Asia/Shanghai}
+            command: ["/bin/bash","-ec"]
+            args:
+            - |
+              TS=$(date +%Y%m%d-%H%M%S)
+              F=/backup/hsf_ts-$TS.dump
+              pg_dump -h hsf-timescale -p 5432 -U hsf -d hsf_ts -Fc -f "$F"
+              # 产物自检：非空 + pg_restore --list 可读（归档目录结构完整性校验）
+              SZ=$(stat -c%s "$F")
+              [ "$SZ" -gt 1024 ] || { echo "BACKUP-FAIL: dump 过小 $SZ bytes"; exit 1; }
+              pg_restore --list "$F" > /tmp/toc.txt
+              echo "toc lines=$(wc -l < /tmp/toc.txt); tables=$(grep -c ' TABLE ' /tmp/toc.txt || true)"
+              # 保留 7 份轮转（按修改时间取最新 7 个）
+              cd /backup && ls -1t hsf_ts-*.dump | sed -n '8,$p' | while read -r old; do rm -f -- "$old"; done
+              echo "== backup dir（保留 7 份轮转后）"
+              ls -la /backup/hsf_ts-*.dump
+              echo "BACKUP-OK hsf_ts $F $SZ bytes"
+            resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
+            volumeMounts: [{name: backup, mountPath: /backup}]
+          volumes:
+          - name: backup
+            persistentVolumeClaim: {claimName: hsf-backup}
+---
+# ─── TiDB 逻辑备份：每周六 04:30，mysqldump hsf_md+hsf_biz，保留 7 份 ───
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hsf-tidb-backup
+  namespace: hsf-prod
+  labels: {app: hsf-backup}
+spec:
+  schedule: "30 4 * * 6"
+  timeZone: Asia/Shanghai
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata: {labels: {app: hsf-backup}}
+        spec:
+          restartPolicy: Never
+          priorityClassName: hsf-batch
+          nodeSelector: {kubernetes.io/hostname: k8s-worker1}
+          containers:
+          - name: dump
+            image: 10.167.2.175:30500/base/mysql:5.7
+            imagePullPolicy: IfNotPresent
+            env:
+            - {name: DB_PASS, valueFrom: {secretKeyRef: {name: hsf-secrets, key: DB_PASS}}}
+            - {name: TZ, value: Asia/Shanghai}
+            command: ["/bin/bash","-ec"]
+            args:
+            - |
+              TS=$(date +%Y%m%d-%H%M%S)
+              F=/backup/hsf_md_biz-$TS.sql
+              mysqldump -h tidb.infra.svc.cluster.local -P 4000 -u hsf_app -p"$DB_PASS" \
+                --set-gtid-purged=OFF --skip-lock-tables --skip-add-locks \
+                --databases hsf_md hsf_biz > "$F" 2>/tmp/err
+              RC=$?
+              grep -v 'Using a password' /tmp/err || true
+              [ "$RC" -eq 0 ] || { echo "BACKUP-FAIL: mysqldump rc=$RC"; exit 1; }
+              # 产物自检：非空、含建表语句（产物可读的最小校验；恢复演练另行留档）
+              SZ=$(stat -c%s "$F")
+              N=$(grep -c '^CREATE TABLE' "$F" || true)
+              [ "$SZ" -gt 1024 ] || { echo "BACKUP-FAIL: dump 过小 $SZ bytes"; exit 1; }
+              [ "$N" -ge 1 ] || { echo "BACKUP-FAIL: 0 张 CREATE TABLE"; exit 1; }
+              cd /backup && ls -1t hsf_md_biz-*.sql | sed -n '8,$p' | while read -r old; do rm -f -- "$old"; done
+              echo "== backup dir（保留 7 份轮转后）"
+              ls -la /backup/hsf_md_biz-*.sql
+              echo "BACKUP-OK hsf_md+hsf_biz $F $SZ bytes create_table=$N"
+            resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
+            volumeMounts: [{name: backup, mountPath: /backup}]
+          volumes:
+          - name: backup
+            persistentVolumeClaim: {claimName: hsf-backup}
+---
+# ─── Redis RDB 导出：每周六 04:45，三节点 --rdb 各一份 + 配置/集群拓扑留档，保留 7 代 ───
+# 口径（docs/24 §4 R-22 ③）：缓存可丢，RDB 产物与 cluster 配置留档为准——emptyDir 数据卷
+# 本身无持久化（10-redis.yaml 设计口径），本导出为"第二位置"副本（3-2-1 最小可行）
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hsf-redis-backup
+  namespace: hsf-prod
+  labels: {app: hsf-backup}
+spec:
+  schedule: "45 4 * * 6"
+  timeZone: Asia/Shanghai
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata: {labels: {app: hsf-backup}}
+        spec:
+          restartPolicy: Never
+          priorityClassName: hsf-batch
+          nodeSelector: {kubernetes.io/hostname: k8s-worker1}
+          containers:
+          - name: rdb
+            image: 10.167.2.175:30500/base/redis:8-alpine
+            imagePullPolicy: IfNotPresent
+            env:
+            - {name: REDIS_PASS, valueFrom: {secretKeyRef: {name: hsf-secrets, key: REDIS_PASS}}}
+            - {name: TZ, value: Asia/Shanghai}
+            command: ["/bin/sh","-ec"]
+            args:
+            - |
+              TS=$(date +%Y%m%d-%H%M%S)
+              D=/backup/redis/$TS
+              mkdir -p "$D"
+              RC=0
+              for n in 0 1 2; do
+                H=hsf-redis-$n.hsf-redis-h.infra.svc.cluster.local
+                redis-cli -h "$H" -p 6379 -a "$REDIS_PASS" --no-auth-warning \
+                  --rdb "$D/redis-hsf-redis-$n-$TS.rdb" || RC=1
+                redis-cli -h "$H" -p 6379 -a "$REDIS_PASS" --no-auth-warning cluster nodes > "$D/cluster-nodes-$n.txt" || true
+                redis-cli -h "$H" -p 6379 -a "$REDIS_PASS" --no-auth-warning config get save > "$D/config-save-$n.txt" || true
+                redis-cli -h "$H" -p 6379 -a "$REDIS_PASS" --no-auth-warning dbsize > "$D/dbsize-$n.txt" || true
+              done
+              redis-cli -h hsf-redis-0.hsf-redis-h.infra.svc.cluster.local -p 6379 \
+                -a "$REDIS_PASS" --no-auth-warning cluster info > "$D/cluster-info.txt" || true
+              [ "$RC" -eq 0 ] || { echo "BACKUP-FAIL: 某节点 --rdb 失败"; exit 1; }
+              # 产物自检：redis-check-rdb 逐份校验 + 非 0 字节
+              for f in "$D"/redis-*.rdb; do
+                S=$(stat -c%s "$f"); [ "$S" -gt 50 ] || { echo "BACKUP-FAIL: $f 仅 $S bytes"; exit 1; }
+                redis-check-rdb "$f" > /dev/null || { echo "BACKUP-FAIL: redis-check-rdb $f 不通过"; exit 1; }
+              done
+              # 保留 7 代（按目录时间序，最新 7 代）
+              ls -1d /backup/redis/2* | sort -r | sed -n '8,$p' | while read -r old; do rm -rf -- "$old"; done
+              echo "== backup dir"
+              ls -la "$D"
+              echo "BACKUP-OK redis 3 节点 RDB + 配置留档 → $D"
+            resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
+            volumeMounts: [{name: backup, mountPath: /backup}]
+          volumes:
+          - name: backup
+            persistentVolumeClaim: {claimName: hsf-backup}

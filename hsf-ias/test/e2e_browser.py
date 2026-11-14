@@ -480,14 +480,19 @@ def main():
         except Exception as e:
             rec("遥感NDVI解译长势", False, str(e)[:80])
 
-        # 21 非农化预警（第二景对 L5306000003 构造降幅 0.30>0.15 且后景 0.25<0.30 → RULE_NDVIFALL）
+        # 21 非农化预警（第二景多地块降幅 → RULE_NDVIFALL；R-13 断言加固：trig_time 地块序号
+        # 偏移修复后，同景多地块降幅各自落行——total≥2 且首屏 parcel_code 互异≥2，
+        # 修复前 uk_rule_reading 三元组全同仅落首条、多地块静默丢失）
         try:
             al, al_code = rs_req("GET", "/alerts?page=1&size=5", atok)
-            ok21 = (al_code == 200 and int(al.get("total") or 0) >= 1
+            parcels21 = {x.get("parcel_code") for x in (al.get("items") or [])}
+            ok21 = (al_code == 200 and int(al.get("total") or 0) >= 2
+                    and len(parcels21) >= 2
                     and (al.get("items") or [{}])[0].get("rule_code") == "RULE_NDVIFALL")
             rec("非农化预警生成", ok21,
-                "total=%s rule=%s" % (al.get("total"),
-                                      (al.get("items") or [{}])[0].get("rule_code")))
+                "total=%s rule=%s parcels=%s" % (al.get("total"),
+                                                 (al.get("items") or [{}])[0].get("rule_code"),
+                                                 sorted(parcels21)))
         except Exception as e:
             rec("非农化预警生成", False, str(e)[:80])
 
@@ -510,16 +515,48 @@ def main():
             rec("上报任务回执闭环", False, str(e)[:80])
 
         # 23 上报 payload 导出（docs/05 §8.1"导出通道"：四类 items 齐全 + WKT 提示）
+        # R-24（2026-11-14，schemaVersion 1.2 / ADR-HSF-024）：geoWkt 完整闭合环且点数=源数据
+        # （landParcel.geojson 逐地块对账）+ phases 三阶段预留结构——旧镜像（<3.0.6）必 FAIL，
+        # 构成 uplink 空间矢量增强的部署门
         try:
             pl, pl_code = ul_req("GET", "/tasks/%s/payload" % batch, atok)
             types = {x.get("type") for x in (pl.get("items") or [])}
             wkt = any(x.get("geoWktHint") for x in (pl.get("items") or [])
                       if x.get("type") == "PARCEL")
+            geo_note = "closed-ring OK"
+            geo_ok = True
+            for x in (pl.get("items") or []):
+                if x.get("type") != "PARCEL":
+                    continue
+                gw = x.get("geoWkt") or ""
+                if not (gw.startswith("POLYGON((") and gw.endswith("))")):
+                    geo_ok, geo_note = False, "geoWkt 形态缺失 code=%s" % x.get("code")
+                    break
+                pts = gw[len("POLYGON(("):-len("))")].split(",")
+                if len(pts) < 4 or pts[0] != pts[-1]:
+                    geo_ok, geo_note = False, "环不闭合/位置不足 code=%s" % x.get("code")
+                    break
+                lp, _lc = gql(page, 'query($c:String!){landParcel(code:$c){geojson}}', atok,
+                              variables={"c": x.get("code")})
+                src = json.loads((((lp.get("data") or {}).get("landParcel") or {})
+                                  .get("geojson")) or "null") or {}
+                coords = ((src.get("geometry") or {}).get("coordinates")
+                          or src.get("coordinates") or [])
+                n_src = len(coords[0]) if coords else 0
+                closed_src = bool(n_src) and coords[0][0] == coords[0][-1]
+                if len(pts) != n_src + (0 if closed_src else 1):
+                    geo_ok = False
+                    geo_note = "点数≠源数据 code=%s gw=%d src=%d" % (x.get("code"), len(pts), n_src)
+                    break
             ok23 = (pl_code == 200 and pl.get("countyCode") == "530600"
-                    and types == {"PARCEL", "PROJECT", "FACILITY", "SENSOR"} and wkt)
+                    and types == {"PARCEL", "PROJECT", "FACILITY", "SENSOR"} and wkt
+                    and pl.get("schemaVersion") == "1.2"
+                    and set(pl.get("phases") or {}) == {"planPhase", "buildPhase", "acceptPhase"}
+                    and geo_ok)
             rec("上报payload导出", ok23,
-                "http=%s county=%s types=%s wkt=%s" % (pl_code, pl.get("countyCode"),
-                                                       sorted(types), wkt))
+                "http=%s county=%s types=%s wkt=%s sv=%s geo=%s"
+                % (pl_code, pl.get("countyCode"), sorted(types), wkt,
+                   pl.get("schemaVersion"), geo_note))
         except Exception as e:
             rec("上报payload导出", False, str(e)[:80])
 

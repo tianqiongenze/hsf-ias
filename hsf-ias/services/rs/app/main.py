@@ -14,7 +14,7 @@ import jwt
 from fastapi import Depends, Header, HTTPException
 
 from hsf_common import db
-from hsf_common.web import create_app
+from hsf_common.web import create_app, decode_token
 
 from . import ingest, ndvi, repo, sample
 
@@ -31,7 +31,7 @@ def require_login(authorization: str = Header(default="")) -> dict:
     if not token:
         raise _http_err(401, "UNAUTHENTICATED", "请先登录")
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        payload = decode_token(token)   # R-31：统一验签入口（HS256 冻结路径 / JWT_ALG=RS256 公钥验签）
     except Exception:
         raise _http_err(401, "UNAUTHENTICATED", "凭据无效或已过期")
     return {"user_id": int(payload.get("sub") or 0),
@@ -172,7 +172,17 @@ try:
             return RsVigor(**{k: (float(v) if isinstance(v, (int, float)) else v)
                               for k, v in r.items() if k in RsVigor.__annotations__})
 
-    schema = strawberry.federation.Schema(query=Query, types=[RsVigor])   # 联邦子图（_service 契约，gw 组合必需）
+    # 联邦子图（_service 契约，gw 组合必需）；R-12（docs/24 §4）：enable_federation_2=True 必传，
+    # 与四子图（iam/land/project/facility）同口径——缺参时 strawberry 0.254.1 走 Federation 1
+    # 形态 SDL（gw 自动升级组合仍可用，但违背 CONVENTIONS.md §2.4/docs/03 §5.6/docs/05 §1.2 冻结要求）。
+    # 注：本子图 RsVigor 为普通类型（docs/08 §2.4 冻结，非 @key 实体）——SDL 是否出现 @link 取决于
+    # 子图是否"在用"联邦指令（strawberry 实现行为，见 tests/test_federation.py 形态判定单测）。
+    # enable_federation_2=True 版本自适应（同 iam/app/schema.py 注记：钉版 0.254.1 走显式参数，
+    # strawberry-graphql≥0.26 参数移除走默认 F2，形态契约不变）
+    try:
+        schema = strawberry.federation.Schema(query=Query, types=[RsVigor], enable_federation_2=True)
+    except TypeError:  # pragma: no cover —— strawberry-graphql≥0.26：参数移除，F2 默认启用
+        schema = strawberry.federation.Schema(query=Query, types=[RsVigor])
     app.include_router(GraphQLRouter(schema), prefix="/graphql")
 except Exception as e:                                    # pragma: no cover
     print(f"[rs] GraphQL 子图初始化失败（服务仍可用 REST）：{e}", flush=True)

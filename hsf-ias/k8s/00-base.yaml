@@ -1,6 +1,6 @@
 # HSF 基础层：命名空间、ResourceQuota、LimitRange、PriorityClass、Secret
-# 依据：CONVENTIONS.md §1/§2.15、hsf/docs/04 §3.0(三库双账号)/§7.3(Secret 键名冻结)、hsf/docs/06 §8.2
-# 注意：密码为强随机示例值，生产部署前必须轮换（kubectl create secret --from-literal 覆盖）
+# 依据：CONVENTIONS.md §1/§2.15/§2.17/§2.18、hsf/docs/04 §3.0(三库双账号)/§7.3(Secret 键名冻结)、hsf/docs/06 §8.2
+# R-07（2026-11-14）：密钥真值出库——本文件不含任何真实密钥，部署期 scripts/gen-secrets.sh 注入（见 Secret 块注释）
 ---
 apiVersion: v1
 kind: Namespace
@@ -96,9 +96,15 @@ spec:
       cpu: "4"
       memory: 6Gi
 ---
-# Secret hsf-secrets（键名冻结：hsf/docs/04 §7.3）
+# Secret hsf-secrets（键名冻结：hsf/docs/04 §7.3、hsf/docs/07 §1.4；R-06 增 SM4_FIELD_KEY）
 # 账号口径（CONVENTIONS §1/§3.2）：hsf_app=三库读写(write_pool) / hsf_ro=三库只读(read_pool)
 # 双连接池 host 均为 tidb.infra.svc.cluster.local:4000——不存在任何只读别名主机名（CONVENTIONS §0/§2.9）
+# R-07（2026-11-14）真值出库：密钥值不再入 manifest——本文件密钥键=空占位符（应用 fail-closed 校验
+#   拒空启动：web.py JWT_SECRET 非空断言 / crypto.py SM4 长度断言 / gw JWT_SECRET 非空断言），
+#   部署期由 scripts/gen-secrets.sh 在部署机生成 CSPRNG 真值后覆盖（gen/ 产物不入 git）。
+#   部署顺序：00-base.yaml → 10-redis.yaml → scripts/gen-secrets.sh（覆盖三处 Secret）→ 20-services.yaml。
+# 分值口径（R-07）：JWT_SECRET prod/dev 强制分值；DB_*/REDIS_*/MQTT_*/TIMESCALE_* 为共享单实例
+#   （TiDB/hsf-redis/hsf-mqtt/hsf-timescale 各一套）两命名空间同值——组件级分值需独立实例，显式声明。
 apiVersion: v1
 kind: Secret
 metadata:
@@ -110,15 +116,30 @@ stringData:
   DB_HOST_READ: tidb.infra.svc.cluster.local:4000
   DB_USER: hsf_app
   DB_USER_RO: hsf_ro
-  DB_PASS: HsfApp-2026-kQ7wX2mVt9pR
-  DB_PASS_RO: HsfRo-2026-z3Nv8cJy5bLd
+  DB_PASS: ""
+  DB_PASS_RO: ""
   REDIS_URL: hsf-redis-0.hsf-redis-h.infra.svc.cluster.local:6379,hsf-redis-1.hsf-redis-h.infra.svc.cluster.local:6379,hsf-redis-2.hsf-redis-h.infra.svc.cluster.local:6379
-  REDIS_PASS: HsfRedis-2026-tR5yJ2hL8wPa
-  # 二期增键（docs/07 §1.4 冻结，两命名空间同步）：MQTT_PASS=mosquitto/sim/iot 共用（MQTT_USER=hsf 固定）；
-  # TIMESCALE_PASS=hsf-timescale(POSTGRES_PASSWORD)/iot(TIMESCALE_DSN)/init-ts.sh 三方共用同一键
-  MQTT_PASS: HsfMqtt-2026-wR6yJ9kQ3vXt
-  TIMESCALE_PASS: HsfTs-2026-mK4vN8xQ2wZr
-  JWT_SECRET: HsfJwt-2026-bN8wQ4vXzA6sD1fG3hKm
+  REDIS_PASS: ""
+  # 二期增键（docs/07 §1.4 冻结，两命名空间同步）：MQTT_PASS=mosquitto 运维账号 hsf（R-20/ADR-HSF-018
+  #   语义收窄：回退开关保留，sim/iot 改分账号键 MQTT_PASS_SIM/MQTT_PASS_IOT）；
+  # TIMESCALE_PASS=hsf-timescale(POSTGRES_PASSWORD)/iot(TIMESCALE_DSN)/init-ts.sh 三方共用同一键；
+  # R-06 增键：SM4_FIELD_KEY=字段加密密钥（iam/facility 消费，crypto.py fail-closed 校验 32 字节 hex）
+  MQTT_PASS: ""
+  MQTT_PASS_SIM: ""   # R-20 增键（2026-11-14，ADR-HSF-018）：sim 发布账号 hsf-sim
+  MQTT_PASS_IOT: ""   # R-20 增键（2026-11-14，ADR-HSF-018）：iot 订阅账号 hsf-iot
+  TIMESCALE_PASS: ""
+  JWT_SECRET: ""
+  # R-31 增键（2026-11-14，ADR-HSF-027）：JWT 签名演进——JWT_ALG=HS256 默认（冻结兼容开关，
+  # 切 RS256 仅改本键值滚动）；JWT_PRIVATE_KEY=签发方 iam 私钥（base64(PEM) 单行）；
+  # JWT_PUBLIC_KEY=gw/REST 验签公钥（base64(PEM)）；*_PREV=轮换期旧公钥/kid（可空）；
+  # JWT_KID=令牌头 kid（gen-secrets.sh RSA-2048 生成，prod/dev 分值）
+  JWT_ALG: "HS256"
+  JWT_KID: ""
+  JWT_PRIVATE_KEY: ""
+  JWT_PUBLIC_KEY: ""
+  JWT_PUBLIC_KEY_PREV: ""
+  JWT_KID_PREV: ""
+  SM4_FIELD_KEY: ""
 ---
 apiVersion: v1
 kind: Secret
@@ -131,14 +152,22 @@ stringData:
   DB_HOST_READ: tidb.infra.svc.cluster.local:4000
   DB_USER: hsf_app
   DB_USER_RO: hsf_ro
-  DB_PASS: HsfApp-2026-kQ7wX2mVt9pR
-  DB_PASS_RO: HsfRo-2026-z3Nv8cJy5bLd
+  DB_PASS: ""
+  DB_PASS_RO: ""
   REDIS_URL: hsf-redis-0.hsf-redis-h.infra.svc.cluster.local:6379,hsf-redis-1.hsf-redis-h.infra.svc.cluster.local:6379,hsf-redis-2.hsf-redis-h.infra.svc.cluster.local:6379
-  REDIS_PASS: HsfRedis-2026-tR5yJ2hL8wPa
-  # 二期增键（docs/07 §1.4 冻结，两命名空间同步）：与 hsf-prod 同值（同构派生 sed 不动 Secret 内容）
-  MQTT_PASS: HsfMqtt-2026-wR6yJ9kQ3vXt
-  TIMESCALE_PASS: HsfTs-2026-mK4vN8xQ2wZr
-  JWT_SECRET: HsfJwt-2026-bN8wQ4vXzA6sD1fG3hKm
+  REDIS_PASS: ""
+  MQTT_PASS: ""
+  MQTT_PASS_SIM: ""   # R-20 增键（2026-11-14，ADR-HSF-018）
+  MQTT_PASS_IOT: ""   # R-20 增键（2026-11-14，ADR-HSF-018）
+  TIMESCALE_PASS: ""
+  JWT_SECRET: ""   # R-07：prod/dev 强制分值（gen-secrets.sh 分别生成）
+  JWT_ALG: "HS256"   # R-31：冻结兼容开关（切换 RS256 仅改本键值+滚动，ADR-HSF-027）
+  JWT_KID: ""
+  JWT_PRIVATE_KEY: ""
+  JWT_PUBLIC_KEY: ""
+  JWT_PUBLIC_KEY_PREV: ""
+  JWT_KID_PREV: ""
+  SM4_FIELD_KEY: ""
 ---
 # 默认拒绝入站；放行同命名空间、监控(Prometheus 抓取)、infra(Redis/TiDB 回包方向不收 ingress 限制)
 # 对齐 DV-IAS k8s/00-base.yaml 同名策略

@@ -19,7 +19,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
-from app.limiter import FixedWindowLimiter
+from app.limiter import FixedWindowLimiter, SlidingWindowLimiter
 
 REQ_TOTAL = Counter("hsf_http_requests_total", "HTTP请求总数", ["svc", "path", "code"])
 REQ_LATENCY = Histogram("hsf_http_request_seconds", "HTTP延迟", ["svc", "path"])
@@ -27,6 +27,12 @@ REQ_LATENCY = Histogram("hsf_http_request_seconds", "HTTP延迟", ["svc", "path"
 # 窗口容量（req/min/键，docs/07 §5.1/§9-③ 二期冻结 1200；env 可调，manifest 注入）：
 # 固定窗口下 429 确定性可复现（1500 突发 vs 1200 必触发），根除一期令牌桶"永打不穿"验收缺陷
 RATE_CAP = int(os.environ.get("RATE_CAP") or "1200") or 1200
+
+# 窗口模式（R-25，2026-11-14，docs/07 §5.1 增补/ADR-HSF-025）：fixed=固定窗口（默认，
+# T-2/§5.1 冻结契约不破坏——429 确定性复现与"相邻两窗 ≤2×cap 突刺"固有语义声明不变）；
+# sliding=滑动窗口（ZSET 剔旧计数，任意 60s 滑窗内通过 ≤cap，消窗口交界突刺）。
+# 响应契约 {allowed, remain} 与键前缀 hsf:rl: 不变；滑窗键后缀 :slide 与固窗分钟 epoch 键隔离。
+RATE_MODE2 = (os.environ.get("RATE_MODE2") or "fixed").strip().lower()
 
 _logger = logging.getLogger("uvicorn.error")
 _client = None
@@ -54,7 +60,8 @@ def get_client():
     return _client
 
 
-limiter = FixedWindowLimiter(RATE_CAP)
+limiter = (SlidingWindowLimiter(RATE_CAP) if RATE_MODE2 == "sliding"
+           else FixedWindowLimiter(RATE_CAP))
 state = {"started": time.time()}
 
 app = FastAPI(title="HSF ratelimit", docs_url=None, redoc_url=None)
@@ -70,7 +77,8 @@ except Exception:
 
 @app.get("/limit")
 def limit(key: str = Query(min_length=1), cost: int = Query(default=1, ge=1)):
-    """扣减一次配额并判定，响应冻结形态 {allowed, remain}。"""
+    """扣减一次配额并判定，响应冻结形态 {allowed, remain}（窗口模式由 RATE_MODE2 选定，
+    fixed 默认/sliding 消突刺——响应形态两模式一致，gw 无感知）。"""
     try:
         return limiter.hit(get_client(), key, cost)
     except Exception as e:  # Redis 不可达/超时等 → 503：gw 收到非 200 即 fail-open 放行（T-3）
