@@ -410,6 +410,9 @@ spec:
         - {name: MQTT_USER, value: "hsf-iot"}
         - {name: MQTT_PASS, valueFrom: {secretKeyRef: {name: hsf-secrets, key: MQTT_PASS_IOT}}}
         - {name: TIMESCALE_PASS, valueFrom: {secretKeyRef: {name: hsf-secrets, key: TIMESCALE_PASS}}}
+        # R-01 刷写多线程（2026-11-15 验收窗口实证 4 worker 缓冲 <2000=刷写瓶颈解除；
+        # docs/25 §3.2：本 env 曾以 kubectl set env 临时生效，此处 manifest 固化为唯一事实源——T-3）
+        - {name: FLUSH_WORKERS, value: "4"}
         # TimescaleDB 连接串（§1.4 冻结形态）：密码引用上方 TIMESCALE_PASS（$(VAR) 仅展开先前显式 env；
         # envFrom 键不参与展开）。短名同命名空间解析，hsf-dev 同构 sed 派生无需替换
         - {name: TIMESCALE_DSN, value: "postgresql://hsf:$(TIMESCALE_PASS)@hsf-timescale:5432/hsf_ts"}

@@ -126,6 +126,8 @@ spec:
           # acl 同拷入 PVC：见 mosquitto.conf 注释——2.1.2 敏感文件属主校验，ConfigMap
           # 直挂（root 属主）不可读；init 每次启动重拷，ConfigMap 变更重启 pod 即生效
           cp /mosquitto/config/acl /mosquitto/data/acl
+          # 复核加固项（2026-11-15）：passwd/acl 收 600 消除 mosquitto "world readable" 启动告警
+          chmod 600 /mosquitto/data/passwd /mosquitto/data/acl
           chown -R 1883:1883 /mosquitto/data
         securityContext: {runAsUser: 0}
         env:
