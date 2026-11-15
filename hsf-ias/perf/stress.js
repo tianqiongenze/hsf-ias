@@ -115,17 +115,41 @@ export function tick() {
 }
 
 // iot-write：POST /sim/tick?steps=500 循环（不顶格 TICK_MAX_STEPS=5000，留 10× 余量，§6.3）；
-// 单迭代 2.4 万条 QoS1 同步发布 ≈2.4~6s（inflight=100），timeout 120s 兜底；迭代间 sleep 5s 排缓冲
+// v1.1（ADR-HSF-028）混合响应：steps=500>SYNC_MAX(4) → sim 返回 202+jobId 后台发布——
+// k6 轮询 /sim/tick/jobs/{jobId} 至 DONE（180s 兜底），iotPublished 记 published 终值，
+// FAILED/超时计入 check 失败；旧同步形态（SIM_ASYNC=off）走 200 分支不变。迭代间 sleep 5s。
 export function iotWrite() {
   const t0 = Date.now();
   const r = http.post(`${SIM}/sim/tick?steps=500`, null, { headers: hdr(), timeout: '120s' });
-  iotTickDur.add(Date.now() - t0);
-  const ok = check(r, { 'tick-200': (r) => r.status === 200 });
-  try {
-    const j = r.json();
-    iotPublished.add(j.published != null ? j.published : (j.inserted != null ? j.inserted : 0));
-  } catch (e) {
-    if (ok) iotPublished.add(24000);   // sim:2.0 契约=published（docs/07 §9-⑤）；兜底按 steps×48 计
+  if (r.status === 202) {
+    let jobId = '';
+    try { jobId = (r.json() || {}).jobId || ''; } catch (e) {}
+    if (!jobId) { check(r, { 'job-id': () => false }); iotTickDur.add(Date.now() - t0); sleep(5); return; }
+    let done = null;
+    for (let i = 0; i < 60; i++) {                              // 60×3s=180s 兜底
+      sleep(3);
+      const s = http.get(`${SIM}/sim/tick/jobs/${jobId}`, { headers: hdr(), timeout: '30s' });
+      try {
+        const j = s.json();
+        if (s.status === 200 && (j.state === 'DONE' || j.state === 'FAILED')) { done = j; break; }
+      } catch (e) {}
+    }
+    iotTickDur.add(Date.now() - t0);
+    if (done && done.state === 'DONE') {
+      iotPublished.add(done.published != null ? done.published : 24000);
+      check(done, { 'job-done': () => true });
+    } else {
+      check(done, { 'job-done': () => false });                 // FAILED/超时计入 check 失败
+    }
+  } else {
+    const ok = check(r, { 'tick-200': (r) => r.status === 200 });
+    try {
+      const j = r.json();
+      iotPublished.add(j.published != null ? j.published : (j.inserted != null ? j.inserted : 0));
+    } catch (e) {
+      if (ok) iotPublished.add(24000);   // sim:2.0 契约=published（docs/07 §9-⑤）；兜底按 steps×48 计
+    }
+    iotTickDur.add(Date.now() - t0);
   }
   sleep(5);
 }

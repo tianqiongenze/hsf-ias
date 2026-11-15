@@ -139,7 +139,12 @@ TiDB(既有) :4000 ── hsf_md/hsf_biz 读写照旧；hsf_ts 二期零写入�
 | mosquitto.conf | `listener 1883 0.0.0.0` / `allow_anonymous false` / `password_file /mosquitto/data/passwd` / `acl_file`（PVC 路径，属主校验） / `persistence true` / `persistence_location /mosquitto/data/` / `max_queued_messages 100000`（R-03 再平衡）/ `max_inflight_messages 1000`（W-1）/ `sys_interval 10`（R-03） |
 | 镜像/部署 | `eclipse-mosquitto:2.1` → `10.167.2.175:30500/base/mosquitto:2.1`；StatefulSet `hsf-mosquitto` 1 副本 + PVC 1Gi（local-path）+ Service `hsf-mqtt:1883`（T-2） |
 
-### 2.5 sim 发布器与 iot 订阅者职责边界（冻结）
+### 2.5 sim 发布器与 iot 订阅者职责边界（冻结；2026-11-15 v1.1 增补见下）
+
+> **v1.1 增补（ADR-HSF-028，用户批准）**：`POST /sim/tick` 升级混合响应——steps≤SYNC_MAX(4)
+> 保持 200 同步+published（本节冻结口径，E2E 契约零改动）；steps>SYNC_MAX 返回 **202+jobId**
+> 后台发布（PublisherPool 4 连接分片并行 + 全局单调取号器 recorded_at 防碰撞 + SIM_ASYNC=off
+> 一键回退）。topic/payload/QoS1/retain 冻结形态不变。详见 docs/adr/ADR-HSF-028 与 docs/25 §10。
 
 | 关注点 | sim（发布器，2.0） | broker | iot（订阅者，2.0） |
 |---|---|---|---|

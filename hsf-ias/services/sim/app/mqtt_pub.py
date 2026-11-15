@@ -60,6 +60,40 @@ def now_local() -> dt.datetime:
     return dt.datetime.now().astimezone()
 
 
+class _MonoClock:
+    """全局单调取号器（v1.1，ADR-HSF-028）：心跳与批量 tick 共用，任何两次取号
+    互不重叠（步进 ≥1ms）——docs/25 §3.2 实证 4VU 并发 tick 各自 now_local() 造成
+    recorded_at 毫秒碰撞（onconflict 8.3%）的根因消除；幂等键唯一性回平台级保证。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last: dt.datetime | None = None
+
+    def next(self) -> dt.datetime:
+        """单条取号：≥上次返回 +1ms。"""
+        with self._lock:
+            now = now_local()
+            if self._last is not None and now <= self._last:
+                now = self._last + dt.timedelta(milliseconds=1)
+            self._last = now
+            return now
+
+    def next_batch(self, n: int) -> dt.datetime:
+        """批量取号基点：预留 [base, base+(n-1)ms] 步进槽位（time_step 同法），
+        批内/跨批/与心跳取号永不重叠。"""
+        with self._lock:
+            base = now_local()
+            if self._last is not None:
+                floor = self._last + dt.timedelta(milliseconds=1)
+                if base < floor:
+                    base = floor
+            self._last = base + dt.timedelta(milliseconds=max(n - 1, 0))
+            return base
+
+
+MONO = _MonoClock()
+
+
 class MqttPublisher:
     """发布线程壳：connect 后 loop_forever（自动重连）；心跳线程按间隔取读数并发布。
 
@@ -73,14 +107,18 @@ class MqttPublisher:
       ② 失败补偿=重投+降速：MQTT_ERR_QUEUE_SIZE（发送队列满=瞬态背压）有界重投（线性退避）
          并触发自适应降速步长（成功后按节流衰减回 0）；NO_CONN/CONN_LOST 等不可瞬态恢复的
          rc 仅计数不重投（断连降速无意义，量级由心跳下一轮自然补齐）；
-      ③ 响应契约不变：publish_readings 仍同步返回被接受（rc==0）条数（docs/07 §2.5 冻结），
-         异步化仅评估不实施；健康链路（pacing=0、无失败）行为与补偿加入前逐字节等价。"""
+      ③ 单连接响应契约不变：publish_readings 仍同步返回被接受（rc==0）条数（docs/07 §2.5），
+         异步化与多连接池（v1.1，ADR-HSF-028）在其上组合实现（app/jobs.py），本类语义不动；
+         健康链路（pacing=0、无失败）行为与补偿加入前逐字节等价。"""
 
     def __init__(self, provider, host: str, port: int, user: str, password: str,
-                 interval: float | None = None):
+                 interval: float | None = None, client_id: str = "hsf-sim-pub",
+                 heartbeat: bool = True):
         self._provider = provider
         self._host, self._port = host, port
         self._user, self._password = user, password
+        self._client_id = client_id             # v1.1 连接池：每连接唯一 id（同 id 会被 broker 互踢）
+        self._heartbeat_on = heartbeat          # 池内仅 0 号连接兼职心跳，其余纯发布
         self._interval = float(interval if interval is not None
                                else os.environ.get("MQTT_INTERVAL", "2"))
         self._connected = threading.Event()
@@ -106,7 +144,7 @@ class MqttPublisher:
         self._update_queue_gauge()
 
     def start(self) -> None:
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="hsf-sim-pub",
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self._client_id,
                              protocol=mqtt.MQTTv311, clean_session=True)
         client.username_pw_set(self._user, self._password)
         client.reconnect_delay_set(1, 30)
@@ -123,9 +161,10 @@ class MqttPublisher:
         client.connect_async(self._host, self._port, keepalive=KEEPALIVE)
         self._client = client
         threading.Thread(target=client.loop_forever, name="sim-mqtt-io", daemon=True).start()
-        self._hb_thread = threading.Thread(target=self._heartbeat, name="sim-mqtt-hb",
-                                           daemon=True)
-        self._hb_thread.start()
+        if self._heartbeat_on:
+            self._hb_thread = threading.Thread(target=self._heartbeat, name="sim-mqtt-hb",
+                                               daemon=True)
+            self._hb_thread.start()
 
     def _heartbeat(self) -> None:
         """心跳循环：连接后按 MQTT_INTERVAL 间隔发布一轮全部 ACTIVE 设备读数。"""

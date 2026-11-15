@@ -21,3 +21,6 @@ PUBLISH_FAIL = Counter("hsf_sim_publish_fail_total", "MQTT 发布 rc≠SUCCESS �
                        ["rc"])
 PUBLISH_RETRY = Counter("hsf_sim_publish_retry_total", "MQTT_ERR_QUEUE_SIZE 有界重投次数")
 PUBLISH_PACING = Gauge("hsf_sim_publish_pacing_seconds", "失败补偿自适应降速步长（s）")
+# v1.1 异步任务面（ADR-HSF-028）：队列深度 + 任务完成计数（state=done/failed）
+JOB_QUEUE_DEPTH = Gauge("hsf_sim_job_queue_depth", "异步批量发布任务队列深度")
+JOB_DONE = Counter("hsf_sim_job_done_total", "异步批量发布任务完成数（按终态分桶）", ["state"])

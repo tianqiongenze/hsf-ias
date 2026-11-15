@@ -40,7 +40,16 @@ MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USER = os.environ.get("MQTT_USER", "hsf")
 MQTT_PASS = os.environ.get("MQTT_PASS", "")
 
+# v1.1 异步化（ADR-HSF-028）：SIM_ASYNC=off 一键回退一期同步行为；SYNC_MAX_STEPS 内
+# 保持同步响应（published 条数——E2E 用例 16 常规契约零改动），超过走 202+jobId
+SIM_ASYNC_ON = os.environ.get("SIM_ASYNC", "on").strip().lower() not in ("off", "0", "false")
+SYNC_MAX_STEPS = max(1, int(os.environ.get("SIM_SYNC_MAX_STEPS", "4")))
+PUB_CLIENTS = max(1, int(os.environ.get("PUB_CLIENTS", "4")))
+
+# 鸭子类型：SIM_ASYNC=on 时为 jobs.PublisherPool（is_connected/publish_readings/
+# published_total/stop 同签名），off 时为单连接 MqttPublisher（完全旧行为）
 publisher: mqtt_pub.MqttPublisher | None = None
+jobs_mgr = None
 
 
 def _http_err(status: int, code: str, msg: str) -> HTTPException:
@@ -66,29 +75,70 @@ def _page(page: int, size: int) -> tuple[int, int]:
 
 
 def _startup():
-    global publisher
+    global publisher, jobs_mgr
     repo.init_db()
     repo.seed_if_empty()  # 48 台设备（幂等双守卫；alert_rule/种子告警已移交 iot）
-    publisher = mqtt_pub.MqttPublisher(repo.heartbeat_readings, MQTT_HOST, MQTT_PORT,
-                                       MQTT_USER, MQTT_PASS)
-    publisher.start()
+    if SIM_ASYNC_ON:
+        from . import jobs
+        pool = jobs.PublisherPool(repo.heartbeat_readings, MQTT_HOST, MQTT_PORT,
+                                  MQTT_USER, MQTT_PASS, size=PUB_CLIENTS)
+        pool.start()
+        publisher = pool
+        jobs_mgr = jobs.JobManager(pool, repo.generate_readings,
+                                   queue_max=int(os.environ.get("SIM_JOB_QUEUE_MAX", "8")))
+        jobs_mgr.start()
+        print(f"[sim] v1.1 异步发布：池连接={PUB_CLIENTS}，steps>{SYNC_MAX_STEPS} 走 202 任务",
+              flush=True)
+    else:
+        publisher = mqtt_pub.MqttPublisher(repo.heartbeat_readings, MQTT_HOST, MQTT_PORT,
+                                           MQTT_USER, MQTT_PASS)
+        publisher.start()
+        jobs_mgr = None
+        print("[sim] SIM_ASYNC=off：一期同步行为（单连接）", flush=True)
 
 
 app.add_event_handler("startup", _startup)
 
 
-# ── 端点 1：POST /sim/tick（FR-502，二期形态：批量触发 MQTT 同步发布）─────────────
+# ── 端点 1：POST /sim/tick（FR-502；v1.1 混合形态，docs/07 §2.5 + ADR-HSF-028）──────
 
 @app.post("/sim/tick")
 def sim_tick(steps: int = 1, user: dict = Depends(require_login)):
-    """steps 轮 × 48 台 → MQTT QoS1 发布 → 返回 published 条数（docs/07 §2.5）。
+    """steps 轮 × 48 台 → MQTT QoS1 发布。
 
-    broker 未连接时 published=0 且 mqtt_connected=false（HTTP 仍 200，k6 iot-write
-    场景以 published 换算吞吐，07 号 §6.3）。"""
-    readings = repo.generate_readings(steps)
+    混合响应（v1.1）：
+      steps≤SYNC_MAX_STEPS（缺省 4）→ 同步发布，200 {"published":N,...}（一期冻结形态，
+        E2E 用例 16"tick 后 5s 内 latest 可查"零改动）；
+      steps>SYNC_MAX_STEPS 且 SIM_ASYNC=on → 入后台任务，202 {"jobId","steps","mode":
+        "async","state":"QUEUED","mqtt_connected"}——即时返回解除单请求 2.4 万条 ×41s
+        串行等待（R-01 tick p95 判据口），进度查 GET /sim/tick/jobs/{jobId}；
+      SIM_ASYNC=off → 全量回退一期同步行为。"""
+    n = max(1, min(int(steps or 1), repo.TICK_MAX_STEPS))
+    if jobs_mgr is not None and n > SYNC_MAX_STEPS:
+        jid = jobs_mgr.submit(n)
+        if jid is None:
+            raise _http_err(503, "BUSY", "异步发布任务队列已满，请稍后重试")
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=202, content={
+            "jobId": jid, "steps": n, "mode": "async", "state": "QUEUED",
+            "mqtt_connected": bool(publisher.is_connected()) if publisher else False})
+    readings = repo.generate_readings(n)
     published = publisher.publish_readings(readings) if publisher else 0
     return {"published": int(published), "steps": len(readings),
             "mqtt_connected": bool(publisher.is_connected()) if publisher else False}
+
+
+# ── 端点 1b：GET /sim/tick/jobs/{job_id}（v1.1 异步任务进度）──────────────────────
+
+@app.get("/sim/tick/jobs/{job_id}")
+def sim_job_status(job_id: str, user: dict = Depends(require_login)):
+    """异步批量发布任务进度：{jobId,steps,state,published[,error]}；404=不存在或已淘汰。"""
+    if jobs_mgr is None:
+        raise _http_err(404, "NOT_FOUND", "异步发布未启用（SIM_ASYNC=off）")
+    j = jobs_mgr.status(job_id)
+    if j is None:
+        raise _http_err(404, "NOT_FOUND", f"任务不存在或已淘汰：{job_id}")
+    return j
 
 
 # ── 端点 2：GET /sim/sensors（FR-501）─────────────────────────────────────────────

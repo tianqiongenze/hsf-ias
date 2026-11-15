@@ -381,7 +381,7 @@ def main():
             if not per_ok:                        # 窗口已占用路径：用已有建议校验决策模型
                 a0, _ = iot_get(page, "/irrigation-advice?page=1&size=10", atok)
                 per_ok = any((it.get("perMuM3") or 0) > 0 for it in (a0.get("items") or []))
-            tk2, _ = sim_post(page, "/sim/tick?steps=200", atok)
+            tk2, tk2_code = sim_post(page, "/sim/tick?steps=200", atok)
             t2, grew = t1, False
             t0 = time.time()
             while time.time() - t0 <= 8.0:       # ≥2 个刷写周期内观测去重效果
@@ -391,10 +391,12 @@ def main():
                     break
                 time.sleep(1)
             path = "窗口空闲-新增" if t1 > bt else "窗口已占用-去重生效"
-            rec("灌溉建议生成与去重", tk1_code == 200 and per_ok and not grew
+            # v1.1（ADR-HSF-028）：steps=200>SYNC_MAX(4) → sim 返回 202 异步（发布语义不变），
+            # 断言接受 200（一期同步）与 202（v1.1 异步）两种响应形态
+            rec("灌溉建议生成与去重", tk1_code in (200, 202) and per_ok and not grew
                 and (t1 > bt or t1 == bt),
                 "路径=%s 前=%s 触发后=%d 复tick后=%d perMuM3>0=%s tick2_http=%s"
-                % (path, bt, t1, t2, per_ok, tk2.get("published", "?") if isinstance(tk2, dict) else "?"))
+                % (path, bt, t1, t2, per_ok, tk2_code))
         except Exception as e:
             rec("灌溉建议生成与去重", False, str(e)[:80])
 

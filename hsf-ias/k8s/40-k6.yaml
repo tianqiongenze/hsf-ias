@@ -2,20 +2,22 @@
 # 阈值对齐 DV-IAS：browse p95<500 / report p95<800 / 失败率<5%（CONVENTIONS §4：0 失败、p95 记录在案）
 # 内嵌脚本与 perf/baseline.js 同源（browse 200VU + report 20VU）
 #
-# 二期 iot-write 时序吞吐场景说明（docs/07 §6.3 冻结设计；T-2：单独报告，不进本 Job thresholds）：
+# 二期 iot-write 时序吞吐场景说明（docs/07 §6.3 + v1.1 ADR-HSF-028；T-2：单独报告，不进本 Job thresholds）：
 #   场景位置：perf/stress.js 的 iot-write 场景（与本 ConfigMap 同源同步原则，本文件不内嵌其脚本）
 #   压测路径：登录态 POST {SIM}/sim/tick?steps=500（直打 sim NodePort 31211——机器流量直连口径，
 #             05 §7 评审 R10；不顶格 TICK_MAX_STEPS=5000，留 10× 余量）
+#   v1.1 混合响应：steps=500>SYNC_MAX(4) → sim 返回 202+jobId 后台发布，k6 轮询
+#             GET /sim/tick/jobs/{jobId} 至 DONE（180s 兜底）；旧同步形态（SIM_ASYNC=off）走 200 分支
 #   负载模型：constant-vus 4 VU × 每 VU 50 次迭代，迭代间 sleep 5s（iot 缓冲排水），
-#             单次请求 timeout 120s；单迭代发布 500 步×48 台=2.4 万条，总量 4×50×2.4 万=480 万条
+#             单迭代发布 500 步×48 台=2.4 万条，总量 4×50×2.4 万=480 万条
 #             （与 docs/07 §3.6"压测余量"容量口径一致）
-#   背压防护：sim 发布器 max_inflight_messages_set(100) 对齐 broker max_inflight_messages（§2.3/§6.3），
-#             防单迭代 2.4 万条 QoS1 同步发布堵死 paho 默认 inflight=20
-#   度量口径：k6 侧 Trend iot_tick_duration + Counter iot_published；结束后取 iot /metrics 的
-#             hsf_iot_readings_written_total 差值 ÷ elapsed = 条/s（全链路：sim 生成→MQTT→iot 缓冲→TimescaleDB 落库）
-#   判读记录：①稳态吞吐条/s ②hsf_iot_flush_seconds p95 ③hsf_iot_onconflict_skipped_total（应≈0）
-#             ④无积压（tick 响应时间无单调上涨）；参考目标 ≥5000 条/s（观测记录，无硬阈值）
-#   报告出口：数值与命令输出写入 docs/21（二期融合测试报告），不参与 k6 thresholds 判定
+#   背压防护：sim 发布池（PUB_CLIENTS=4 分片并行）+ max_inflight 1000（W-1）+ R-02 有界重投/降速
+#   度量口径：k6 侧 Trend iot_tick_duration（202 接受→任务 DONE 全程）+ Counter iot_published（终值）；
+#             结束后取 iot /metrics 的 hsf_iot_readings_written_total 差值 ÷ elapsed = 条/s
+#             （全链路：sim 生成→MQTT→iot 缓冲→TimescaleDB 落库）
+#   判读记录：①稳态吞吐条/s（R-01 判据 ≥5,000）②hsf_iot_flush_seconds p95 ③onconflict（v1.1 单调取号后应≈0）
+#             ④无积压（hsf_sim_job_queue_depth）
+#   报告出口：数值与命令输出写入 docs/25（优化重构验收报告），不参与 k6 thresholds 判定
 ---
 apiVersion: v1
 kind: ConfigMap

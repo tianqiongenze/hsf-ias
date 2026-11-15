@@ -114,7 +114,9 @@ def generate_readings(steps: int = 1, sensors: list[dict] | None = None) -> list
     village_code)。recorded_at 步进 1ms（一期同法），保证 iot 侧幂等键可区分。"""
     steps = max(1, min(int(steps or 1), TICK_MAX_STEPS))
     sensors = sensors if sensors is not None else active_sensors()
-    base = mqtt_pub.now_local()
+    # v1.1（ADR-HSF-028）：基点经全局单调取号器预留 n 个步进槽位——并发 tick/心跳
+    # 取号互不重叠，recorded_at 毫秒碰撞（onconflict 8.3%）根因消除
+    base = mqtt_pub.MONO.next_batch(steps)
     readings: list[tuple] = []
     for i in range(steps):
         ts = base + dt.timedelta(milliseconds=i)
@@ -129,7 +131,7 @@ def heartbeat_readings() -> list[tuple]:
     sensors = active_sensors()
     if not sensors:
         return []
-    ts = mqtt_pub.now_local()
+    ts = mqtt_pub.MONO.next()   # v1.1：心跳取号同走单调器（与 tick 批量槽位互斥）
     return [(s["sensor_code"], s["metric"], rules.next_value(s["metric"]), ts, s["village_code"])
             for s in sensors]
 

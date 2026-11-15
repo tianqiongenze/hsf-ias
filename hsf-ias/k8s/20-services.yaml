@@ -278,7 +278,7 @@ spec:
       containers:
       - name: app
         # 2026-11-15 部署窗口：R-02 发布侧指标（mqtt_pub 队列/rc 计数）+R-31 decode_token——3.0→3.0.6
-        image: 10.167.2.175:30500/hsf/sim:3.0.6
+        image: 10.167.2.175:30500/hsf/sim:3.0.7
         ports: [{containerPort: 8095}]
         envFrom: [{secretRef: {name: hsf-secrets}}]
         env:
