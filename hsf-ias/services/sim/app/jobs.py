@@ -83,7 +83,8 @@ class JobManager:
     单 worker 下跨任务基点天然有序，recorded_at 全局唯一（onconflict≈0）。
     任务记录保留最近 keep 条（OrderedDict 淘汰），status 对未知/已淘汰 id 返回 None。"""
 
-    def __init__(self, pool: PublisherPool, gen, queue_max: int = 8, keep: int = 64):
+    def __init__(self, pool: PublisherPool, gen, queue_max: int = 8, keep: int = 64,
+                 workers: int = 1):
         self._pool = pool
         self._gen = gen
         self._q: queue.Queue[str] = queue.Queue(maxsize=max(1, int(queue_max)))
@@ -92,6 +93,10 @@ class JobManager:
         self._lock = threading.Lock()
         self._seq = 0
         self._stop = threading.Event()
+        # v1.1 调优项（docs/25 §10）：并发 job worker——recorded_at 全局有序由
+        # MONO.next_batch 槽位预留保证（并发任务取号互不重叠），单 worker 不再是
+        # 吞吐结构上限；workers=1 为缺省（保守等价旧行为）
+        self._workers = max(1, int(workers))
 
     def submit(self, steps: int) -> str | None:
         """入队一个批量发布任务；队列满返回 None（端点转 503 BUSY）。"""
@@ -145,7 +150,9 @@ class JobManager:
                 metrics.JOB_DONE.labels(state="failed").inc()
 
     def start(self) -> None:
-        threading.Thread(target=self.worker_loop, name="sim-job-worker", daemon=True).start()
+        for i in range(self._workers):
+            threading.Thread(target=self.worker_loop, name=f"sim-job-worker-{i}",
+                             daemon=True).start()
 
     def stop(self) -> None:
         self._stop.set()

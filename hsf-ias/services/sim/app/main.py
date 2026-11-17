@@ -85,7 +85,8 @@ def _startup():
         pool.start()
         publisher = pool
         jobs_mgr = jobs.JobManager(pool, repo.generate_readings,
-                                   queue_max=int(os.environ.get("SIM_JOB_QUEUE_MAX", "8")))
+                                   queue_max=int(os.environ.get("SIM_JOB_QUEUE_MAX", "8")),
+                                   workers=max(1, int(os.environ.get("SIM_JOB_WORKERS", "4"))))
         jobs_mgr.start()
         print(f"[sim] v1.1 异步发布：池连接={PUB_CLIENTS}，steps>{SYNC_MAX_STEPS} 走 202 任务",
               flush=True)

@@ -188,3 +188,24 @@ def test_off_switch_creates_plain_publisher():
     m.SIM_ASYNC_ON = False
     assert m.SIM_ASYNC_ON is False                              # 关闭语义在位
     assert hasattr(m, "jobs_mgr")                               # 模块含异步槽位（on 才赋值）
+
+
+def test_job_parallel_workers_two_tasks_concurrently():
+    """v1.1 调优（docs/25 §10）：workers=2 时两个慢任务并发推进（PUBLISHING 重叠）——
+    MONO.next_batch 槽位隔离保证 recorded_at 全局有序，并发安全前提已具备。"""
+    pool = jobs.PublisherPool.__new__(jobs.PublisherPool)
+    pool._size = 2
+    pool._clients = [_CountingPub(delay=0.4), _CountingPub(delay=0.4)]
+    gate = threading.Event()
+    mgr = jobs.JobManager(pool, lambda n: (gate.wait(2), [])[1], workers=2, queue_max=4)
+    mgr.start()
+    j1, j2 = mgr.submit(1), mgr.submit(1)
+    time.sleep(0.2)
+    s1, s2 = mgr.status(j1), mgr.status(j2)
+    assert s1["state"] == "PUBLISHING" and s2["state"] == "PUBLISHING"   # 双 worker 并发
+    gate.set()
+    for _ in range(50):
+        if mgr.status(j1)["state"] == "DONE" and mgr.status(j2)["state"] == "DONE":
+            break
+        time.sleep(0.05)
+    assert mgr.status(j1)["state"] == "DONE"

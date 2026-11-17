@@ -178,7 +178,7 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: land-svc}}}
       containers:
       - name: app
-        image: 10.167.2.175:30500/hsf/land:1.0.1
+        image: 10.167.2.175:30500/hsf/land:3.0.8
         ports: [{containerPort: 8092}]
         envFrom: [{secretRef: {name: hsf-secrets}}]
         resources: {requests: {cpu: 150m, memory: 256Mi}, limits: {cpu: "1", memory: 512Mi}}
@@ -210,7 +210,7 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: project-svc}}}
       containers:
       - name: app
-        image: 10.167.2.175:30500/hsf/project:1.0.1
+        image: 10.167.2.175:30500/hsf/project:3.0.8
         ports: [{containerPort: 8093}]
         envFrom: [{secretRef: {name: hsf-secrets}}]
         resources: {requests: {cpu: 150m, memory: 256Mi}, limits: {cpu: "1", memory: 512Mi}}
@@ -242,7 +242,7 @@ spec:
             podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: facility-svc}}}
       containers:
       - name: app
-        image: 10.167.2.175:30500/hsf/facility:1.0.2
+        image: 10.167.2.175:30500/hsf/facility:3.0.8
         ports: [{containerPort: 8094}]
         envFrom: [{secretRef: {name: hsf-secrets}}]
         env:
@@ -278,7 +278,7 @@ spec:
       containers:
       - name: app
         # 2026-11-15 部署窗口：R-02 发布侧指标（mqtt_pub 队列/rc 计数）+R-31 decode_token——3.0→3.0.6
-        image: 10.167.2.175:30500/hsf/sim:3.0.7
+        image: 10.167.2.175:30500/hsf/sim:3.0.8
         ports: [{containerPort: 8095}]
         envFrom: [{secretRef: {name: hsf-secrets}}]
         env:
@@ -289,6 +289,10 @@ spec:
         # docs/07 §9-④⑤），故无 TIMESCALE_* env
         - {name: MQTT_USER, value: "hsf-sim"}
         - {name: MQTT_PASS, valueFrom: {secretKeyRef: {name: hsf-secrets, key: MQTT_PASS_SIM}}}
+        # v1.1 异步化调优（ADR-HSF-028 + docs/25 §11）：并发 job worker——recorded_at 全局
+        # 有序由 MONO.next_batch 槽位隔离保证，SIM_JOB_WORKERS=4 解除 JobManager 单 worker
+        # 串行瓶颈（发布池 11k/s 能力与队列供给匹配）
+        - {name: SIM_JOB_WORKERS, value: "4"}
         resources: {requests: {cpu: 250m, memory: 384Mi}, limits: {cpu: "2", memory: 1Gi}}
         readinessProbe: {httpGet: {path: /readyz, port: 8095}, periodSeconds: 5, failureThreshold: 3}
         livenessProbe: {httpGet: {path: /healthz, port: 8095}, initialDelaySeconds: 20, periodSeconds: 10}
