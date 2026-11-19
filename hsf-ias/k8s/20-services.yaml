@@ -278,7 +278,7 @@ spec:
       containers:
       - name: app
         # 2026-11-15 部署窗口：R-02 发布侧指标（mqtt_pub 队列/rc 计数）+R-31 decode_token——3.0→3.0.6
-        image: 10.167.2.175:30500/hsf/sim:3.0.8
+        image: 10.167.2.175:30500/hsf/sim:3.0.9
         ports: [{containerPort: 8095}]
         envFrom: [{secretRef: {name: hsf-secrets}}]
         env:
@@ -293,7 +293,14 @@ spec:
         # 有序由 MONO.next_batch 槽位隔离保证，SIM_JOB_WORKERS=4 解除 JobManager 单 worker
         # 串行瓶颈（发布池 11k/s 能力与队列供给匹配）
         - {name: SIM_JOB_WORKERS, value: "4"}
-        resources: {requests: {cpu: 250m, memory: 384Mi}, limits: {cpu: "2", memory: 1Gi}}
+        # R-01 判据收口②（docs/25 §12）：run9 实证 4 连接 × PUBACK 窗口 ≈2,000 条/s 天花板
+        # （CPU 已富余 1,140m/4C）——PUB_CLIENTS 4→8 线性扩连接（v1.1 语义内 env 调优）
+        - {name: PUB_CLIENTS, value: "8"}
+        # R-01 判据收口（docs/25 §12）：run8 实证 CPU 1110m/2000m 顶限——limits 2→4C
+        # （quota 36C 内重分配，W-2 冻结不变；requests 同步上调保调度公平）
+        # OOM 修复（docs/25 §12）：8 连接×50k/conn 发送队列 + 并发 job payload 撑爆 1Gi
+        # （00:11:33 OOMKilled exit 137 实证）——内存 1Gi→2Gi（quota 48Gi 不变）
+        resources: {requests: {cpu: 500m, memory: 768Mi}, limits: {cpu: "4", memory: 2Gi}}
         readinessProbe: {httpGet: {path: /readyz, port: 8095}, periodSeconds: 5, failureThreshold: 3}
         livenessProbe: {httpGet: {path: /healthz, port: 8095}, initialDelaySeconds: 20, periodSeconds: 10}
 ---
@@ -421,10 +428,12 @@ spec:
         # envFrom 键不参与展开）。短名同命名空间解析，hsf-dev 同构 sed 派生无需替换
         - {name: TIMESCALE_DSN, value: "postgresql://hsf:$(TIMESCALE_PASS)@hsf-timescale:5432/hsf_ts"}
         resources: {requests: {cpu: 250m, memory: 384Mi}, limits: {cpu: "2", memory: 1Gi}}
-        # R-21 startupProbe（口径同 iam）：MQTT 订阅线程+TS 连接池+registry 刷新慢启动，60s 覆盖窗
-        startupProbe: {httpGet: {path: /healthz, port: 8097}, periodSeconds: 5, failureThreshold: 12}
-        readinessProbe: {httpGet: {path: /readyz, port: 8097}, periodSeconds: 5, failureThreshold: 3}
-        livenessProbe: {httpGet: {path: /healthz, port: 8097}, initialDelaySeconds: 20, periodSeconds: 10}
+        # R-21 startupProbe（口径同 iam）：MQTT 订阅线程+TS 连接池+registry 刷新慢启动——
+        # 2026-11-19 CrashLoop 收口：sensor_reading 42M 行后启动期负载上升，timeout=1s+60s 窗口
+        # 被探测超时击杀（exit 137 九连杀实证）——timeout 1→3s、窗口 60→300s
+        startupProbe: {httpGet: {path: /healthz, port: 8097}, periodSeconds: 5, timeoutSeconds: 3, failureThreshold: 60}
+        readinessProbe: {httpGet: {path: /readyz, port: 8097}, periodSeconds: 5, timeoutSeconds: 3, failureThreshold: 3}
+        livenessProbe: {httpGet: {path: /healthz, port: 8097}, initialDelaySeconds: 20, periodSeconds: 10, timeoutSeconds: 3}
 ---
 apiVersion: v1
 kind: Service

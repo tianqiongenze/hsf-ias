@@ -23,9 +23,10 @@ KEEPALIVE = 30
 
 # ── R-02 失败补偿常量（docs/24 §4 R-02 approach ②；健康链路零开销——pacing 恒 0 不睡眠）──
 PUB_RETRIES = 2            # MQTT_ERR_QUEUE_SIZE 有界重投次数（env MQTT_PUB_RETRIES 可调，0=关闭）
-PUB_QUEUE_MAX = 50000      # paho 发送队列上限（env MQTT_PUB_QUEUE_MAX；0=不限=旧行为。
+PUB_QUEUE_MAX = 20000      # paho 发送队列上限（env MQTT_PUB_QUEUE_MAX；0=不限=旧行为。
                            # paho 缺省 0=无限——队列满计数指标要有真实背压信号须有界；
-                           # 50k ≈ iot-write 单迭代 2.4 万条 ×2 余量，正常 tick 不触顶）
+                           # 50k→20k（docs/25 §12 OOM 修复：8 连接并发下 8×50k=400k 条内存
+                           # 缓冲撑爆 1Gi/2Gi；20k×8=160k 上限 + 重投补偿仍够单迭代 2.4 万条））
 PACING_STEP = 0.002        # 每次队列满失败步长 +2ms（降速②）
 PACING_MAX = 0.02          # 降速上限 20ms/条（饱和背压下让 paho IO 线程有机会排空队列）
 PACING_RETRY_SLEEP = 0.005 # 重投间隔基数 5ms（随重试序号线性退避）
